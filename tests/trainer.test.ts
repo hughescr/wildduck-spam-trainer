@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { MAX_MESSAGE_BYTES } from '../src/header-strip';
 import {
-    ADDRESS, BODY_MARKER, buildApp, emlResponse, FakeKey, hamHook, hamRoutes, hook, jsonResponse, KEY, LEARN, mailboxResponse, messageResponse, parse,
-    RAW_MESSAGE, SENSITIVE, spamRoutes, status, STRIPPED_MESSAGE, SUBJECT, UID, USER, MAILBOX, webhookBody, type Routes,
+    ADDRESS, BODY_MARKER, buildApp, earlyLearn, emlResponse, FakeKey, hamHook, hamRoutes, hook, jsonResponse, KEY, LEARN, mailboxResponse, messageResponse, parse,
+    RAW_MESSAGE, SENSITIVE, spamRoutes, status, streamingRoute, STRIPPED_MESSAGE, SUBJECT, UID, USER, MAILBOX, webhookBody, type Routes,
 } from './helpers';
 
 const text = (bytes: Uint8Array | undefined) => new TextDecoder().decode(bytes);
@@ -281,6 +281,10 @@ describe('learn outcomes', () => {
         const result = await harness.app(hook());
         expect(parse(result)).toEqual({ action: 'skipped', reason: 'too_large' });
         expect(produced).toBeLessThanOrEqual(27);
+        // The upload ended by error, not a clean end, and the learn request was aborted.
+        const learn = harness.calls.find(call => call.url.startsWith(LEARN));
+        expect(learn?.uploadEnd).toBe('error');
+        expect(learn?.signal.aborted).toBe(true);
     });
 
     test('a header section over 1 MiB is a permanent skip without a learn request', async () => {
@@ -311,6 +315,177 @@ describe('learn outcomes', () => {
         const result = await harness.app(hook());
         expect(result.statusCode).toBe(502);
         expect(parse(result)).toEqual({ action: 'retry', reason: 'eml_read_failed' });
+        const learn = harness.calls.find(call => call.url.startsWith(LEARN));
+        expect(learn?.uploadEnd).toBe('error');
+        expect(learn?.signal.aborted).toBe(true);
+    });
+});
+
+describe('a 2xx is a hand-off only once the upload completed', () => {
+    const encoder = new TextEncoder();
+    /** A source that yields `head`, then (after a delay each) `bodyChunks`, then ends, errors or stalls. */
+    const slowSource = (head: string, bodyChunks: string[], ending: 'end' | 'error' | 'stall' = 'end', onCancel?: () => void) => {
+        let index = 0;
+        return new ReadableStream<Uint8Array>({
+            start(controller) { controller.enqueue(encoder.encode(head)); },
+            async pull(controller) {
+                await Bun.sleep(5);
+                const chunk = bodyChunks[index++];
+                if (chunk !== undefined) {
+                    controller.enqueue(encoder.encode(chunk));
+                } else if (ending === 'end') {
+                    controller.close();
+                } else if (ending === 'error') {
+                    controller.error(new Error('connection reset'));
+                } else {
+                    await new Promise(() => undefined);
+                }
+            },
+            cancel() { onCancel?.(); },
+        }, { highWaterMark: 0 });
+    };
+    const hangingSource = () => new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(encoder.encode('Subject: x\r\n\r\npartial')); },
+        pull: () => new Promise<void>(() => undefined),
+    }, { highWaterMark: 0 });
+
+    test('early 200 before the body is drained, then a source error mid-body: retryable, and the upload ends in an error', async () => {
+        const source = new ReadableStream<Uint8Array>({
+            start(controller) { controller.enqueue(encoder.encode('Subject: x\r\n\r\npartial')); },
+            pull(controller) { controller.error(new Error('connection reset')); },
+        }, { highWaterMark: 0 });
+        const { route, upload } = earlyLearn(() => jsonResponse(200, { success: true }));
+        const harness = buildApp({ routes: spamRoutes({ eml: () => emlResponse(source), learn: route }) });
+        const result = await harness.app(hook());
+        await upload.done;
+        expect(result.statusCode).toBe(502);
+        expect(parse(result)).toEqual({ action: 'retry', reason: 'eml_read_failed' });
+        expect(upload.chunksBeforeResponse).toBe(1);
+        expect(upload.end).toBe('error');
+        expect(upload.call?.signal.aborted).toBe(true);
+        expect(harness.records().some(record => record['event'] === 'message_streamed')).toBe(false);
+    });
+
+    test('early 200 with the body still pending and a healthy source: the whole message is delivered, then trained', async () => {
+        const chunks = Array.from({ length: 8 }, (_, index) => `${BODY_MARKER}-${index}\r\n`);
+        const raw = `Delivered-To: ${ADDRESS}\r\nX-Rspamd-Score: 3\r\nSubject: ${SUBJECT}\r\n\r\n`;
+        const { route, upload } = earlyLearn(() => jsonResponse(200, { success: true }));
+        const harness = buildApp({ routes: spamRoutes({ eml: () => emlResponse(slowSource(raw, chunks)), learn: route }) });
+        const result = await harness.app(hook());
+        // The handler answered only after the upload completed.
+        expect(upload.end).toBe('eof');
+        expect(parse(result)).toEqual({ action: 'trained' });
+        expect(upload.chunksBeforeResponse).toBe(1);
+        expect(upload.text()).toBe(`Subject: ${SUBJECT}\r\n\r\n${chunks.join('')}`);
+        expect(upload.call?.signal.aborted).toBe(false);
+    });
+
+    test('early 200 with the fixture message: bytes received equal the normalized message', async () => {
+        const { route, upload } = earlyLearn(() => jsonResponse(200, { success: true }), 0);
+        const harness = buildApp({ routes: hamRoutes({ learn: route }) });
+        const result = await harness.app(hamHook());
+        expect(upload.chunksBeforeResponse).toBe(0);
+        expect(upload.end).toBe('eof');
+        expect(parse(result)).toEqual({ action: 'trained' });
+        expect(upload.text()).toBe(STRIPPED_MESSAGE);
+    });
+
+    for (const [code, expected, webhook] of [
+        [503, { action: 'retry', reason: 'upstream_unavailable' }, 502],
+        [401, { action: 'retry', reason: 'proxy_auth_failed' }, 502],
+        [413, { action: 'skipped', reason: 'too_large' }, 200],
+        [400, { action: 'skipped', reason: 'learn_rejected' }, 200],
+    ] as const) {
+        test(`early ${code} before the body is drained: classified by status, upload aborted by error`, async () => {
+            let cancelled = false;
+            const { route, upload } = earlyLearn(() => status(code));
+            const harness = buildApp({ routes: spamRoutes({ eml: () => emlResponse(slowSource('Subject: x\r\n\r\n', ['a', 'b', 'c'], 'end', () => { cancelled = true; })), learn: route }) });
+            const result = await harness.app(hook());
+            await upload.done;
+            expect(result.statusCode).toBe(webhook);
+            expect(parse(result)).toEqual(expected);
+            expect(upload.end).toBe('error');
+            expect(upload.call?.signal.aborted).toBe(true);
+            expect(cancelled).toBe(true);
+        });
+    }
+
+    test('a learn response whose body cancel never settles does not hold the response', async () => {
+        for (const code of [200, 208, 400, 503]) {
+            const body = new ReadableStream<Uint8Array>({ cancel: () => new Promise<void>(() => undefined) });
+            const harness = buildApp({ routes: spamRoutes({ learn: () => new Response(body, { status: code }) }) });
+            const started = Date.now();
+            // 3.5 s remaining minus the 3 s reserve: a 500 ms deadline.
+            const result = await harness.app(hook(), { getRemainingTimeInMillis: () => 3_500 });
+            expect(Date.now() - started).toBeLessThan(500);
+            expect(result.statusCode).toBe(code === 503 ? 502 : 200);
+        }
+    });
+
+    test('lookup and eml bodies whose cancel never settles do not hold the response', async () => {
+        const never = (code: number, headers: Record<string, string> = {}) => () => new Response(new ReadableStream<Uint8Array>({ cancel: () => new Promise<void>(() => undefined) }), { status: code, headers });
+        for (const [routes, expected] of [
+            [spamRoutes({ mailbox: never(404) }), { action: 'skipped', reason: 'stale' }],
+            [spamRoutes({ eml: never(500) }), { action: 'retry', reason: 'upstream_unavailable' }],
+            [spamRoutes({ eml: never(200, { 'content-length': String(MAX_MESSAGE_BYTES + 1) }) }), { action: 'skipped', reason: 'too_large' }],
+        ] as const) {
+            const harness = buildApp({ routes });
+            const started = Date.now();
+            const result = await harness.app(hook(), { getRemainingTimeInMillis: () => 3_500 });
+            expect(Date.now() - started).toBeLessThan(500);
+            expect(parse(result)).toEqual(expected);
+        }
+    });
+
+    test('early 200, then the size cap trips mid-upload: permanent skip, upload ends by error, request aborted', async () => {
+        const chunk = 'a'.repeat(1024 * 1024);
+        const { route, upload } = earlyLearn(() => jsonResponse(200, { success: true }));
+        const harness = buildApp({ routes: spamRoutes({ eml: () => emlResponse(slowSource('Subject: x\r\n\r\n', Array.from({ length: 30 }, () => chunk))), learn: route }) });
+        const result = await harness.app(hook());
+        await upload.done;
+        expect(parse(result)).toEqual({ action: 'skipped', reason: 'too_large' });
+        expect(upload.end).toBe('error');
+        expect(upload.call?.signal.aborted).toBe(true);
+    });
+
+    test('the deadline expiring mid-upload: 503, the upload ends by error, the request is aborted', async () => {
+        const harness = buildApp({ routes: spamRoutes({ eml: () => emlResponse(hangingSource()) }) });
+        const started = Date.now();
+        // 3.2 s remaining minus the 3 s reserve: a 200 ms budget.
+        const result = await harness.app(hook(), { getRemainingTimeInMillis: () => 3_200 });
+        expect(Date.now() - started).toBeLessThan(2_000);
+        expect(result.statusCode).toBe(503);
+        expect(parse(result)).toEqual({ action: 'retry', reason: 'timeout' });
+        const learn = harness.calls.find(call => call.url.startsWith(LEARN));
+        expect(learn?.uploadEnd).toBe('error');
+        expect(learn?.signal.aborted).toBe(true);
+    });
+
+    test('early 200, then the deadline expires before the upload completes: 503, never trained', async () => {
+        const { route, upload } = earlyLearn(() => jsonResponse(200, { success: true }));
+        const harness = buildApp({ routes: spamRoutes({ eml: () => emlResponse(hangingSource()), learn: route }) });
+        const started = Date.now();
+        const result = await harness.app(hook(), { getRemainingTimeInMillis: () => 3_200 });
+        await upload.done;
+        expect(Date.now() - started).toBeLessThan(2_000);
+        expect(result.statusCode).toBe(503);
+        expect(parse(result)).toEqual({ action: 'retry', reason: 'timeout' });
+        expect(upload.end).toBe('error');
+        expect(upload.call?.signal.aborted).toBe(true);
+    });
+
+    test('early 200, then the learn side stops reading (cancels the upload): retryable upload_incomplete, never trained', async () => {
+        const route = streamingRoute(async call => {
+            const reader = call.stream?.getReader();
+            await reader?.read();
+            reader?.cancel().catch(() => undefined);
+            return jsonResponse(200, { success: true });
+        });
+        const harness = buildApp({ routes: spamRoutes({ eml: () => emlResponse(slowSource('Subject: x\r\n\r\n', ['a', 'b'])), learn: route }) });
+        const result = await harness.app(hook());
+        expect(result.statusCode).toBe(502);
+        expect(parse(result)).toEqual({ action: 'retry', reason: 'upload_incomplete' });
+        expect(harness.records().find(record => record['event'] === 'upload_incomplete')).toMatchObject({ level: 'error', upstream: 'learn', upstreamStatus: 200 });
     });
 });
 
@@ -325,15 +500,20 @@ describe('malformed messages are skipped, never trained', () => {
         ['continuation before any field', ` folded\r\nSubject: a\r\n\r\n${BODY_MARKER}`, 'leading_continuation'],
         ['mbox From envelope line', `From ${ADDRESS} Mon Jan  1 00:00:00 2026\r\nSubject: a\r\n\r\n${BODY_MARKER}`, 'mbox_envelope'],
         ['empty message', '', 'empty'],
+        ['no header fields (starts with a CRLF blank line)', `\r\n${BODY_MARKER}`, 'no_headers'],
+        ['no header fields (starts with an LF blank line)', `\n${BODY_MARKER}`, 'no_headers'],
+        ['only blank lines', '\r\n\r\n\r\n', 'no_headers'],
     ];
     for (const [name, raw, code] of CASES) {
         test(`${name}: no learn request, 200 skipped/malformed_message, warn log with code ${code} only`, async () => {
-            for (const [routes, request] of [[spamRoutes({ eml: () => emlResponse(raw) }), hook()], [hamRoutes({ eml: () => emlResponse(raw) }), hamHook()]] as const) {
+            for (const [routes, request, lookups] of [[spamRoutes({ eml: () => emlResponse(raw) }), hook(), 2], [hamRoutes({ eml: () => emlResponse(raw) }), hamHook(), 3]] as const) {
                 const { app, calls, records, lines } = buildApp({ routes });
                 const result = await app(request);
                 expect(result.statusCode).toBe(200);
                 expect(parse(result)).toEqual({ action: 'skipped', reason: 'malformed_message' });
+                // Requests are recorded on entry, before any body is read: zero learn entries.
                 expect(calls.filter(call => call.url.startsWith(LEARN))).toHaveLength(0);
+                expect(calls).toHaveLength(lookups);
                 expect(records().find(record => record['event'] === 'message_malformed')).toMatchObject({ level: 'warn', upstream: 'eml', reason: code });
                 expect(records().find(record => record['event'] === 'request_completed')).toMatchObject({ level: 'warn', outcome: 'skipped', reason: 'malformed_message', status: 200 });
                 const all = lines.join('\n');
@@ -355,6 +535,7 @@ describe('malformed messages are skipped, never trained', () => {
         const { app, calls } = buildApp({ routes: spamRoutes({ eml: () => emlResponse(source) }) });
         expect(parse(await app(hook()))).toEqual({ action: 'skipped', reason: 'malformed_message' });
         expect(calls.filter(call => call.url.startsWith(LEARN))).toHaveLength(0);
+        expect(calls).toHaveLength(2);
         expect(cancelled).toBe(true);
         expect(pulls).toBeLessThanOrEqual(1);
     });

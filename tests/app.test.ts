@@ -48,9 +48,13 @@ describe('origin verification precedes everything', () => {
         expect(parse(await app(hook(), { getRemainingTimeInMillis: () => 25_000 }))).toEqual({ action: 'trained' });
         expect(originSignal).toBeInstanceOf(AbortSignal);
         expect(keySignal).toBe(originSignal);
-        // The .eml download and the learn upload use the request deadline's signal directly.
+        // The .eml download uses the request deadline's signal directly. The learn upload's
+        // signal follows the deadline and also aborts when the upload is interrupted (the
+        // deadline half is covered by the learn-hang and mid-upload deadline tests).
         expect(calls[1]?.signal).toBe(originSignal);
-        expect(calls[2]?.signal).toBe(originSignal);
+        expect(calls[2]?.signal).toBeInstanceOf(AbortSignal);
+        expect(calls[2]?.signal).not.toBe(originSignal);
+        expect(calls[2]?.signal.aborted).toBe(false);
     });
 
     test('time spent verifying the origin counts against the request deadline', async () => {

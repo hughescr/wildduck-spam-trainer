@@ -55,13 +55,22 @@ class Stop extends Error {
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const isAbort = (error: unknown) => typeof error === 'object' && error !== null && 'name' in error && ['AbortError', 'TimeoutError'].includes(String((error as { name: unknown }).name));
 
-async function discard(response: Response): Promise<void> {
+/**
+ * Cancels an unneeded body without waiting: a cancel that never settles must not
+ * delay the response to WildDuck.
+ */
+function discard(response: Response): void {
     try {
-        await response.body?.cancel();
+        response.body?.cancel().catch(() => undefined);
     } catch {
         // Nothing to recover: the body is not needed.
     }
 }
+
+/** One macrotask: lets the fetch implementation finish writing the request (its final chunk) after reading its end. */
+const nextMacrotask = () => new Promise<void>(resolve => {
+    setImmediate(resolve);
+});
 
 /** Reads at most `limit` bytes; returns undefined when the body is larger. */
 async function readCapped(response: Response, limit: number): Promise<Uint8Array | undefined> {
@@ -78,7 +87,7 @@ async function readCapped(response: Response, limit: number): Promise<Uint8Array
         }
         total += value.length;
         if (total > limit) {
-            await reader.cancel().catch(() => undefined);
+            reader.cancel().catch(() => undefined);
             return undefined;
         }
         parts.push(value);
@@ -212,12 +221,12 @@ class TrainingRun {
     }
 
     /** Shared status handling for the WildDuck-side lookups (mailbox, message, eml). */
-    private async checkLookupStatus(upstream: UpstreamName, response: Response): Promise<void> {
+    private checkLookupStatus(upstream: UpstreamName, response: Response): void {
         const status = response.status;
         if (status === 200) {
             return;
         }
-        await discard(response);
+        discard(response);
         if (status === 404) {
             // Moved or deleted between the event and now: harmless.
             throw new Stop(skipped('stale', 'info'));
@@ -235,7 +244,7 @@ class TrainingRun {
 
     private async lookup(upstream: 'mailbox' | 'message', url: string): Promise<Record<string, unknown>> {
         const response = await this.call(upstream, url, { method: 'GET', headers: { Accept: 'application/json' } }, this.deadline.signalFor(this.lookupTimeoutMs));
-        await this.checkLookupStatus(upstream, response);
+        this.checkLookupStatus(upstream, response);
         let bytes: Uint8Array | undefined;
         try {
             bytes = await readCapped(response, MAX_JSON_BYTES);
@@ -274,10 +283,10 @@ class TrainingRun {
      */
     private async learn(endpoint: 'learn-spam' | 'learn-ham'): Promise<Decision> {
         const eml = await this.call('eml', `${this.base}/messages/${this.request.uid}/message.eml`, { method: 'GET', headers: { Accept: 'message/rfc822' } }, this.deadline.signal);
-        await this.checkLookupStatus('eml', eml);
+        this.checkLookupStatus('eml', eml);
         const declared = parseLength(eml);
         if (declared !== undefined && declared > MAX_MESSAGE_BYTES) {
-            await discard(eml);
+            discard(eml);
             return skipped('too_large');
         }
         const source = eml.body ?? new ReadableStream<Uint8Array>({ start: controller => controller.close() });
@@ -291,33 +300,55 @@ class TrainingRun {
         }
         const stripped: StrippedBody = opened.body;
         try {
+            // An interrupted upload also aborts the request, so the proxy sees an aborted
+            // request rather than a complete one.
             const response = await this.call('learn', `${this.options.learnBaseUrl}/${endpoint}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'message/rfc822' },
                 body: stripped.stream,
                 duplex: 'half',
-            }, this.deadline.signal, () => this.streamFailure(stripped.failure()));
-            const failure = this.streamFailure(stripped.failure());
-            if (failure) {
-                // The proxy answered after our own stream aborted (truncated upload); our reason is authoritative.
-                await discard(response);
-                return failure;
-            }
-            this.log.info('message_streamed', { upstream: 'eml', bytes: stripped.stripper.inputBytes, removedHeaders: stripped.stripper.removedFields });
-            return await this.learnResult(response);
+            }, AbortSignal.any([this.deadline.signal, stripped.signal]), () => this.streamFailure(stripped.failure()));
+            return await this.learnResult(response, stripped);
         } finally {
-            stripped.release();
+            // No-op once the upload completed; otherwise it ends by error, never by a clean end.
+            stripped.abort();
         }
     }
 
     /**
-     * Maps the learn status (relayed by the proxy) to a decision. Only the status is
-     * used; the body is never read. Any 2xx means the message was handed off.
+     * Maps the learn response (relayed by the proxy) to a decision. Only the status is
+     * used; the body is never read. A 2xx means the message was handed off only once
+     * the whole upload has completed.
      */
-    private async learnResult(response: Response): Promise<Decision> {
+    private async learnResult(response: Response, stripped: StrippedBody): Promise<Decision> {
         const status = response.status;
-        await discard(response);
-        if (status >= 200 && status < 300) {
+        const success = status >= 200 && status < 300;
+        if (!success) {
+            // An early error answer stops an unfinished upload (by abort); the status is then classified.
+            stripped.abort();
+        } else if ((await stripped.settled) === 'complete') {
+            // A 2xx counts only once the upload completes, so an early one waits for that or
+            // its failure (the deadline fails it). The response body is left alone meanwhile:
+            // cancelling it aborts the request, and the end of the upload with it. Node's fetch
+            // writes the final chunk only after reading the stream's end, so one macrotask
+            // passes before the cancel below (the smoke test fails without it).
+            await nextMacrotask();
+        }
+        discard(response);
+        const failure = this.streamFailure(stripped.failure());
+        if (failure) {
+            // Our own stream failed (truncated upload); our reason is authoritative over any status.
+            return failure;
+        }
+        if (success && stripped.state() !== 'complete') {
+            // The consumer stopped reading before the end: a partial upload is never a hand-off.
+            this.log.error('upload_incomplete', { upstream: 'learn', upstreamStatus: status });
+            return this.deadline.expired() ? retry('timeout', 503) : retry('upload_incomplete');
+        }
+        if (stripped.state() === 'complete') {
+            this.log.info('message_streamed', { upstream: 'eml', bytes: stripped.stripper.inputBytes, removedHeaders: stripped.stripper.removedFields });
+        }
+        if (success) {
             // 208: already learned; 204: not learnable (token count, learn conditions). Log detail only.
             return trained(status === 208 ? 'already_learned' : status === 204 ? 'not_learnable' : 'trained');
         }

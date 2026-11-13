@@ -19,7 +19,9 @@
  *    (see {@link MalformedReason}) on a bare CR, a NUL byte, a line that is neither
  *    a field start (`name[WSP]:`, name bytes 33-126 except `:`) nor a continuation
  *    line after a field, a continuation line before any field, an mbox `From `
- *    envelope line, or an empty message. CRLF, bare LF and mixed line endings,
+ *    envelope line, a header section with no field at all (the message starts
+ *    with the blank line, or is only blank lines; judged before any removal),
+ *    or an empty message. CRLF, bare LF and mixed line endings,
  *    8-bit bytes in field values, long lines and a message without a blank line
  *    or body are valid.
  *
@@ -53,7 +55,7 @@ export const POST_SCAN_HEADER_NAMES: ReadonlySet<string> = new Set([
 export const LEADING_DELIVERY_HEADER_NAMES: readonly string[] = ['delivered-to', 'return-path'];
 
 /** Category codes for a malformed message (never content). */
-export type MalformedReason = 'empty' | 'bare_cr' | 'nul' | 'invalid_line' | 'leading_continuation' | 'mbox_envelope';
+export type MalformedReason = 'empty' | 'no_headers' | 'bare_cr' | 'nul' | 'invalid_line' | 'leading_continuation' | 'mbox_envelope';
 
 export class HeaderSectionTooLarge extends Error {
     override readonly name = 'HeaderSectionTooLarge';
@@ -320,6 +322,10 @@ export class HeaderStripper {
 
     /** Emits the validated header section buffer[0, end), normalized, and whatever follows it. */
     private complete(end: number): Uint8Array[] {
+        if (this.fields.length === 0) {
+            // Judged on the original message, before any removal.
+            throw new MalformedMessage('no_headers');
+        }
         const { output, removedFields } = removeFields(this.buffer.subarray(0, end), this.fields);
         this.removedFields = removedFields;
         this.inHeaderSection = false;
@@ -353,13 +359,31 @@ export function stripHeaders(input: Uint8Array, options?: HeaderStripperOptions)
 
 export type StripFailure = 'message_too_large' | 'header_too_large' | 'malformed_message' | 'source_error';
 
+/**
+ * - `pending`: the upload is still running.
+ * - `complete`: the stream reached the source's real end and the consumer pulled every byte and the end.
+ * - `failed`: the upload was interrupted (source error, size cap, deadline, {@link StrippedBody.abort}, or the consumer cancelled it).
+ */
+export type UploadState = 'pending' | 'complete' | 'failed';
+
 export interface StrippedBody {
     readonly stream: ReadableStream<Uint8Array>;
     readonly stripper: HeaderStripper;
-    /** Why the stream errored, when the failure originated here rather than downstream. */
+    /**
+     * Aborted as soon as the upload fails, for any reason. Give it to the request
+     * that carries {@link stream}, so an interrupted upload also aborts the request.
+     */
+    readonly signal: AbortSignal;
+    /** Settles with the final state (never rejects); bounded by the open signal. */
+    readonly settled: Promise<'complete' | 'failed'>;
+    state(): UploadState;
+    /** Why the upload failed, when the failure originated here (source error, size cap, deadline) rather than downstream. */
     failure(): StripFailure | undefined;
-    /** Stops reading the source (idempotent, never throws). */
-    release(): void;
+    /**
+     * Interrupts an unfinished upload: errors the stream (never a clean end), cancels
+     * the source and aborts {@link signal}. No-op once complete or failed; never throws.
+     */
+    abort(): void;
 }
 
 export type OpenedBody =
@@ -367,7 +391,7 @@ export type OpenedBody =
     | { readonly ok: false; readonly failure: StripFailure; readonly malformed?: MalformedReason };
 
 export interface OpenOptions extends HeaderStripperOptions {
-    /** Aborts reading the source (the request deadline). */
+    /** The request deadline: aborts reading the header section, and fails an unfinished upload. */
     signal?: AbortSignal;
 }
 
@@ -387,11 +411,16 @@ function classify(error: unknown): StripFailure {
  * then the rest of the source unchanged. On failure the source is cancelled and
  * nothing is returned to send. After the header section, nothing is read from
  * the source until the consumer pulls, so the body is never buffered.
+ *
+ * The stream ends normally only at the source's real end. Every interruption
+ * (source error, size cap, the signal, abort(), a consumer cancel) errors the
+ * stream and aborts `body.signal`, so a partial message never looks complete.
  */
 export async function openStrippedBody(source: ReadableStream<Uint8Array>, options: OpenOptions = {}): Promise<OpenedBody> {
     const stripper = new HeaderStripper(options);
     const reader = source.getReader();
     let released = false;
+    // Never awaited: a source whose cancel never settles must not block anything.
     const release = () => {
         if (!released) {
             released = true;
@@ -443,54 +472,90 @@ export async function openStrippedBody(source: ReadableStream<Uint8Array>, optio
     }
 
     let failure: StripFailure | undefined;
+    let state: UploadState = 'pending';
+    let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const interrupted = new AbortController();
+    let settle: (final: 'complete' | 'failed') => void = () => undefined;
+    const settled = new Promise<'complete' | 'failed'>(resolve => {
+        settle = resolve;
+    });
+    const onDeadline = () => fail('source_error', new Error('aborted'));
+    const finish = (final: 'complete' | 'failed') => {
+        state = final;
+        signal?.removeEventListener('abort', onDeadline);
+        settle(final);
+    };
+    /** Ends the upload by error, never by a normal close. */
+    function fail(reason: StripFailure | undefined, error: unknown = new Error('upload interrupted')): void {
+        if (state !== 'pending') {
+            return;
+        }
+        failure = reason;
+        try {
+            streamController?.error(error);
+        } catch {
+            // Already closed by a consumer cancel.
+        }
+        release();
+        interrupted.abort(error);
+        finish('failed');
+    }
+
+    // At most one chunk per pull: with highWaterMark 0, pull runs only while the
+    // consumer waits on a read, so every enqueued chunk goes straight to it and
+    // the close (with an empty queue) means the consumer has pulled everything.
     const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+            streamController = controller;
+        },
         async pull(controller) {
-            if (head.length > 0) {
-                for (const chunk of head) {
-                    controller.enqueue(chunk);
-                }
-                head = [];
-                if (sourceDone) {
-                    controller.close();
-                }
-                return;
-            }
-            if (sourceDone) {
-                controller.close();
-                return;
-            }
             for (;;) {
+                if (state !== 'pending') {
+                    return;
+                }
+                const next = head.shift();
+                if (next) {
+                    controller.enqueue(next);
+                    return;
+                }
+                if (sourceDone) {
+                    if (controller.desiredSize === 0) {
+                        controller.close();
+                        finish('complete');
+                    }
+                    return;
+                }
                 let value: Uint8Array | undefined;
                 try {
                     value = await read();
                 } catch (error) {
-                    failure = 'source_error';
-                    release();
-                    throw error;
-                }
-                if (value === undefined) {
-                    controller.close();
+                    fail('source_error', error);
                     return;
                 }
-                let out: Uint8Array[];
-                try {
-                    out = stripper.push(value);
-                } catch (error) {
-                    failure = classify(error);
-                    release();
-                    throw error;
+                if (state !== 'pending') {
+                    // Interrupted while reading: the end of a cancelled source is not the message's end.
+                    return;
                 }
-                if (out.length > 0) {
-                    for (const chunk of out) {
-                        controller.enqueue(chunk);
-                    }
+                if (value === undefined) {
+                    sourceDone = true;
+                    continue;
+                }
+                try {
+                    head = stripper.push(value);
+                } catch (error) {
+                    fail(classify(error), error);
                     return;
                 }
             }
         },
         cancel() {
-            release();
+            fail(undefined);
         },
     }, { highWaterMark: 0 });
-    return { ok: true, body: { stream, stripper, failure: () => failure, release } };
+    if (signal?.aborted) {
+        fail('source_error', new Error('aborted'));
+    } else {
+        signal?.addEventListener('abort', onDeadline, { once: true });
+    }
+    return { ok: true, body: { stream, stripper, signal: interrupted.signal, settled, state: () => state, failure: () => failure, abort: () => fail(undefined) } };
 }

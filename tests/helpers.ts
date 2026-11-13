@@ -77,8 +77,104 @@ export class FakeKey implements TrainingKeySource {
     invalidate() { this.invalidations++; }
 }
 
-export interface RecordedCall { url: string; method: string; headers: Headers; signal: AbortSignal; body?: Uint8Array }
+export interface RecordedCall {
+    url: string;
+    method: string;
+    headers: Headers;
+    signal: AbortSignal;
+    /** The upload as sent; a {@link streamingRoute} reads it itself. */
+    stream?: ReadableStream<Uint8Array>;
+    /** The drained upload (routes that are not streaming routes). */
+    body?: Uint8Array;
+    /** How the drained upload ended: its normal end, or an error. */
+    uploadEnd?: 'eof' | 'error';
+}
 export type Route = (call: RecordedCall) => Response | Promise<Response>;
+
+const STREAMING = Symbol('streaming');
+/** Marks a route that reads the upload itself (`call.stream`), so it can answer before or while reading it. */
+export const streamingRoute = (route: Route): Route => Object.assign(route, { [STREAMING]: true });
+const isStreaming = (route: Route) => STREAMING in route;
+
+/** What a {@link earlyLearn} double saw of the upload. */
+export interface UploadSeen {
+    /** Bytes received so far, as latin1 text. */
+    text(): string;
+    /** Chunks read before the double answered. */
+    chunksBeforeResponse: number;
+    /** How the upload ended (undefined while it is still running). */
+    end: 'eof' | 'error' | undefined;
+    /** Settles when the background read of the upload ends. */
+    done: Promise<void>;
+    call?: RecordedCall;
+}
+
+/**
+ * A learn double that answers after reading `readFirst` upload chunks and then keeps
+ * reading the rest in the background, like a server that answers early.
+ */
+export function earlyLearn(respond: () => Response, readFirst = 1): { route: Route; upload: UploadSeen } {
+    const parts: Uint8Array[] = [];
+    const upload: UploadSeen = { text: () => Buffer.concat(parts).toString('latin1'), chunksBeforeResponse: 0, end: undefined, done: Promise.resolve() };
+    const route = streamingRoute(async call => {
+        upload.call = call;
+        if (!call.stream) {
+            throw new Error('expected a streaming upload');
+        }
+        const reader = call.stream.getReader();
+        const readOne = async (): Promise<boolean> => {
+            const { done, value } = await reader.read();
+            if (done) {
+                upload.end = 'eof';
+                return false;
+            }
+            parts.push(value);
+            return true;
+        };
+        try {
+            for (let index = 0; index < readFirst && await readOne(); index++) {
+                upload.chunksBeforeResponse++;
+            }
+        } catch {
+            upload.end = 'error';
+        }
+        upload.done = (async () => {
+            try {
+                while (upload.end === undefined && await readOne()) {
+                    // Keep reading after answering.
+                }
+            } catch {
+                upload.end = 'error';
+            }
+        })();
+        return respond();
+    });
+    return { route, upload };
+}
+
+/** Reads a whole upload like a server would, recording how it ended; an error rejects like fetch does. */
+async function drain(call: RecordedCall, stream: ReadableStream<Uint8Array>): Promise<void> {
+    const reader = stream.getReader();
+    const parts: Uint8Array[] = [];
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) {
+                break;
+            }
+            parts.push(value);
+        }
+    } catch (error) {
+        call.uploadEnd = 'error';
+        call.body = new Uint8Array(Buffer.concat(parts));
+        throw new TypeError('fetch failed', { cause: error });
+    }
+    call.uploadEnd = 'eof';
+    call.body = new Uint8Array(Buffer.concat(parts));
+    if (call.signal.aborted) {
+        throw call.signal.reason;
+    }
+}
 
 const jsonResponse = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 export const mailboxResponse = (specialUse: string | null, id = MAILBOX) => jsonResponse(200, { success: true, id, path: specialUse ? specialUse.slice(1) : 'INBOX', specialUse });
@@ -94,7 +190,12 @@ export interface Routes {
     learn?: Route;
 }
 
-/** A recording fetch double. Unrouted URLs fail the test loudly. */
+/**
+ * A recording fetch double. Each request is recorded on entry, before any body is
+ * read, so "no request" assertions cannot pass vacuously. Unless the route is a
+ * {@link streamingRoute}, the upload is drained before the route answers. Unrouted
+ * URLs fail the test loudly.
+ */
 export function mockFetch(routes: Routes) {
     const calls: RecordedCall[] = [];
     const base = `${API}/users/${USER}/mailboxes/${MAILBOX}`;
@@ -103,10 +204,7 @@ export function mockFetch(routes: Routes) {
         if (init.redirect !== 'error' || !init.signal) {
             throw new Error('every upstream request must use redirect: error and an abort signal');
         }
-        const call: RecordedCall = { url: input, method: init.method ?? 'GET', headers, signal: init.signal };
-        if (init.body instanceof ReadableStream) {
-            call.body = new Uint8Array(await new Response(init.body).arrayBuffer());
-        }
+        const call: RecordedCall = { url: input, method: init.method ?? 'GET', headers, signal: init.signal, ...(init.body instanceof ReadableStream ? { stream: init.body } : {}) };
         calls.push(call);
         let route: Route | undefined;
         if (input === base) { route = routes.mailbox; }
@@ -115,6 +213,9 @@ export function mockFetch(routes: Routes) {
         else if (input === `${LEARN}/learn-spam` || input === `${LEARN}/learn-ham`) { route = routes.learn; }
         if (!route) {
             throw new Error(`unexpected upstream request ${input}`);
+        }
+        if (call.stream && !isStreaming(route)) {
+            await drain(call, call.stream);
         }
         return route(call);
     };

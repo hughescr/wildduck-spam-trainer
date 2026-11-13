@@ -87,6 +87,10 @@ function reference(input: Uint8Array, cap = MAX_HEADER_SECTION_BYTES): Outcome {
         }
         fields.push({ name: (field[1] ?? '').toLowerCase(), text: line });
     }
+    // No header field at all (judged on the original message, before removals).
+    if (fields.length === 0) {
+        return 'malformed';
+    }
     const drop = fields.map(field => POST_SCAN.includes(field.name));
     const [first, second] = fields;
     if (first && LEADING.includes(first.name)) {
@@ -260,6 +264,12 @@ describe('malformed messages (rule C)', () => {
         ['mbox From envelope line first', 'From sender@example.org Mon Jan  1 00:00:00 2026\r\nSubject: s\r\n\r\nb', 'mbox_envelope'],
         ['bare mbox From line', 'From ', 'mbox_envelope'],
         ['empty message', '', 'empty'],
+        ['starts with the blank line (CRLF)', '\r\nbody', 'no_headers'],
+        ['starts with the blank line (LF)', '\nbody', 'no_headers'],
+        ['starts with the blank line, header-like body', '\r\nX-Rspamd-Score: 1\r\n', 'no_headers'],
+        ['a lone CRLF', '\r\n', 'no_headers'],
+        ['a lone LF', '\n', 'no_headers'],
+        ['only blank lines', '\r\n\r\n\n\r\n', 'no_headers'],
     ];
     for (const [name, raw, reason] of CASES) {
         test(`${name} → ${reason}`, () => {
@@ -305,9 +315,9 @@ describe('valid edge cases', () => {
         expect(strip(raw)).toBe(`Subject: caf\xe9 \xff\xfe\x80\r\nX-Long: ${'v'.repeat(200_000)}\r\n\r\nbody`);
     });
 
-    test('a message that starts with the blank line has an empty header section and passes unchanged', () => {
-        expect(strip('\r\nX-Rspamd-Score: 1\r\n')).toBe('\r\nX-Rspamd-Score: 1\r\n');
-        expect(strip('\n')).toBe('\n');
+    test('the no-header rule is judged before removals: a message of only removed fields is valid', () => {
+        expect(strip('Delivered-To: a\r\nReturn-Path: <b>\r\n\r\nbody')).toBe('\r\nbody');
+        expect(strip('X-Rspamd-Score: 1\n\nbody')).toBe('\nbody');
     });
 
     test('a message with nothing to remove is returned unchanged', () => {
@@ -341,6 +351,9 @@ describe('chunk boundaries against the whole-buffer reference', () => {
         'Subject: a\n\r\n',
         'Subject: a\r\n\r\n',
         '\r\n\r\n',
+        '\r\nbody',
+        '\nbody',
+        'Delivered-To: a\r\nReturn-Path: <b>\r\n\r\nbody',
         'Subject: a\r\nnot a header\r\n\r\nbody',
         'Subject: a\rb\r\n\r\nbody',
         'Subject: a\r',
@@ -377,6 +390,7 @@ describe('chunk boundaries against the whole-buffer reference', () => {
         const values = ['', ' v', ' value with spaces', '\tTAB value', ' caf\xe9 \xff', ' a:b:c', ` ${'x'.repeat(90)}`];
         const malformed = ['no colon here', ':leading colon', 'Bad Name: x', 'Subject', 'From sender date', 'Na\x00me: x', 'X: a\x00b', '\xe9name: x', ' '];
         const counts = { ok: 0, malformed: 0, header_too_large: 0 };
+        let noHeaders = 0;
         for (let round = 0; round < 4000; round++) {
             const clean = random() < 0.5;
             const eol = () => (clean ? pick(['\r\n', '\n']) : pick(['\r\n', '\r\n', '\n', '\n', '\r']));
@@ -413,11 +427,15 @@ describe('chunk boundaries against the whole-buffer reference', () => {
                 throw new Error(`round ${round} (cap ${cap}, sizes ${sizes.join(',')}): ${JSON.stringify(raw)} → ${describeOutcome(outcome)}, reference ${describeOutcome(expected)}`);
             }
             counts[typeof expected === 'string' ? expected : 'ok']++;
+            if (expected === 'malformed' && malformedReason(raw) === 'no_headers') {
+                noHeaders++;
+            }
         }
-        // The generator exercises every path substantially.
+        // The generator exercises every path substantially, including messages with no header field.
         expect(counts.ok).toBeGreaterThan(1000);
         expect(counts.malformed).toBeGreaterThan(1000);
         expect(counts.header_too_large).toBeGreaterThan(200);
+        expect(noHeaders).toBeGreaterThan(50);
     });
 
     test('a caller reusing its chunk buffer cannot corrupt buffered header bytes', () => {
@@ -543,6 +561,7 @@ describe('openStrippedBody', () => {
             [[latin1('Subject: a\r\nbad line\r\n\r\n'), new Uint8Array(1024)], 'malformed_message', 'invalid_line'],
             [[latin1('Subject: a\r'), latin1('x\r\n\r\n')], 'malformed_message', 'bare_cr'],
             [[], 'malformed_message', 'empty'],
+            [[latin1('\r\nbody'), new Uint8Array(1024)], 'malformed_message', 'no_headers'],
             [[latin1(`S: ${'a'.repeat(200)}`)], 'header_too_large', undefined],
         ] as const) {
             let cancelled = false;
@@ -577,5 +596,141 @@ describe('openStrippedBody', () => {
         expect(Date.now() - started).toBeLessThan(1_000);
         const already = await openStrippedBody(sourceOf([latin1('Subject: a\r\n\r\n')]), { signal: AbortSignal.abort() });
         expect(already).toEqual({ ok: false, failure: 'source_error' });
+    });
+});
+
+describe('openStrippedBody upload state', () => {
+    const open = async (source: ReadableStream<Uint8Array>, options?: Parameters<typeof openStrippedBody>[1]) => {
+        const opened = await openStrippedBody(source, options);
+        if (!opened.ok) { throw new Error('expected ok'); }
+        return opened.body;
+    };
+    /** A source that serves `chunks`, then ends (or stalls when `stall` is set). */
+    const sourceOf = (chunks: Uint8Array[], options: { stall?: boolean; onCancel?: () => void } = {}) => {
+        let index = 0;
+        return new ReadableStream<Uint8Array>({
+            pull(controller) {
+                const chunk = chunks[index++];
+                if (chunk) { controller.enqueue(chunk); return undefined; }
+                return options.stall ? new Promise<void>(() => undefined) : controller.close();
+            },
+            cancel() { options.onCancel?.(); },
+        }, { highWaterMark: 0 });
+    };
+    /** Reads `count` chunks (all when undefined) and reports how the read ended. */
+    const consume = async (reader: ReadableStreamDefaultReader<Uint8Array>, count = Infinity) => {
+        const parts: Uint8Array[] = [];
+        try {
+            while (parts.length < count) {
+                const { done, value } = await reader.read();
+                if (done) { return { text: text(new Uint8Array(Buffer.concat(parts))), end: 'eof' as const }; }
+                parts.push(value);
+            }
+        } catch {
+            return { text: text(new Uint8Array(Buffer.concat(parts))), end: 'error' as const };
+        }
+        return { text: text(new Uint8Array(Buffer.concat(parts))), end: undefined };
+    };
+
+    test('complete only once the consumer has pulled every byte and the end', async () => {
+        const body = await open(sourceOf([latin1('X-Rspamd-Score: 1\r\nSubject: a\r\n\r\none'), latin1(' two'), latin1(' three')]));
+        const reader = body.stream.getReader();
+        const first = await consume(reader, 3);
+        expect(first).toEqual({ text: 'Subject: a\r\n\r\none two', end: undefined });
+        await Bun.sleep(5);
+        expect(body.state()).toBe('pending');
+        expect(await consume(reader, 1)).toEqual({ text: ' three', end: undefined });
+        // Every byte pulled, but not yet the end.
+        expect(body.state()).toBe('pending');
+        expect(await consume(reader)).toEqual({ text: '', end: 'eof' });
+        expect(body.state()).toBe('complete');
+        expect(await body.settled).toBe('complete');
+        expect(body.signal.aborted).toBe(false);
+        // abort() after completion changes nothing.
+        body.abort();
+        expect(body.state()).toBe('complete');
+        expect(body.signal.aborted).toBe(false);
+    });
+
+    test('a header-only message completes after its single chunk', async () => {
+        const body = await open(sourceOf([latin1('Subject: a\r\nX-Rspamd-Bar: +\r\n')]));
+        expect(await consume(body.stream.getReader())).toEqual({ text: 'Subject: a\r\n', end: 'eof' });
+        expect(await body.settled).toBe('complete');
+    });
+
+    test('abort() mid-upload ends the stream by error, never a clean end, cancels the source and aborts the signal', async () => {
+        let cancelled = false;
+        const body = await open(sourceOf([latin1('Subject: x\r\n\r\npartial'), latin1('more')], { stall: true, onCancel: () => { cancelled = true; } }));
+        const reader = body.stream.getReader();
+        // The normalized header section, then the rest of that chunk from the separator on.
+        expect(await consume(reader, 2)).toEqual({ text: 'Subject: x\r\n\r\npartial', end: undefined });
+        body.abort();
+        expect(await consume(reader)).toEqual({ text: '', end: 'error' });
+        expect(body.state()).toBe('failed');
+        expect(body.failure()).toBeUndefined();
+        expect(body.signal.aborted).toBe(true);
+        expect(cancelled).toBe(true);
+        expect(await body.settled).toBe('failed');
+    });
+
+    test('abort() while a source read is in flight: the cancelled source end is not the message end', async () => {
+        const body = await open(sourceOf([latin1('Subject: x\r\n\r\n')], { stall: true }));
+        const reader = body.stream.getReader();
+        expect(await consume(reader, 2)).toEqual({ text: 'Subject: x\r\n\r\n', end: undefined });
+        const pending = consume(reader);
+        await Bun.sleep(5);
+        body.abort();
+        expect(await pending).toEqual({ text: '', end: 'error' });
+        expect(body.state()).toBe('failed');
+    });
+
+    test('a source error mid-body errors the upload and aborts the signal', async () => {
+        let sent = false;
+        const body = await open(new ReadableStream({ pull(controller) { if (sent) { controller.error(new Error('reset')); } else { sent = true; controller.enqueue(latin1('Subject: x\r\n\r\npartial')); } } }));
+        expect(await consume(body.stream.getReader())).toEqual({ text: 'Subject: x\r\n\r\npartial', end: 'error' });
+        expect(body.failure()).toBe('source_error');
+        expect(body.signal.aborted).toBe(true);
+        expect(await body.settled).toBe('failed');
+    });
+
+    test('the size cap mid-body errors the upload and aborts the signal', async () => {
+        const body = await open(sourceOf([latin1('Subject: a\r\n\r\n'), new Uint8Array(60), new Uint8Array(60)]), { maxMessageBytes: 100 });
+        expect((await consume(body.stream.getReader())).end).toBe('error');
+        expect(body.failure()).toBe('message_too_large');
+        expect(body.signal.aborted).toBe(true);
+    });
+
+    test('the signal fails an unfinished upload even while the consumer is not reading', async () => {
+        const deadline = new AbortController();
+        let cancelled = false;
+        const body = await open(sourceOf([latin1('Subject: a\r\n\r\nbody')], { onCancel: () => { cancelled = true; } }), { signal: deadline.signal });
+        const reader = body.stream.getReader();
+        expect(await consume(reader, 1)).toEqual({ text: 'Subject: a\r\n', end: undefined });
+        deadline.abort();
+        expect(body.state()).toBe('failed');
+        expect(body.failure()).toBe('source_error');
+        expect(body.signal.aborted).toBe(true);
+        expect(cancelled).toBe(true);
+        expect(await consume(reader)).toEqual({ text: '', end: 'error' });
+    });
+
+    test('a consumer cancel fails the upload (it never completed)', async () => {
+        const body = await open(sourceOf([latin1('Subject: a\r\n\r\nbody'), latin1('more')]));
+        const reader = body.stream.getReader();
+        await consume(reader, 1);
+        await reader.cancel();
+        expect(body.state()).toBe('failed');
+        expect(body.failure()).toBeUndefined();
+        expect(body.signal.aborted).toBe(true);
+    });
+
+    test('a source whose cancel never settles does not block abort()', async () => {
+        const source = new ReadableStream<Uint8Array>({
+            start(controller) { controller.enqueue(latin1('Subject: a\r\n\r\nbody')); },
+            cancel: () => new Promise<void>(() => undefined),
+        }, { highWaterMark: 0 });
+        const body = await open(source);
+        body.abort();
+        expect(await body.settled).toBe('failed');
     });
 });
