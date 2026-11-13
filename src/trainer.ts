@@ -1,6 +1,6 @@
 import { TRAINING_KEY_HEADER } from './config';
 import type { Deadline } from './deadline';
-import { createStrippedBody, MAX_MESSAGE_BYTES, type StrippedBody } from './header-strip';
+import { MAX_MESSAGE_BYTES, openStrippedBody, type StripFailure, type StrippedBody } from './header-strip';
 import type { Logger, LogLevel, UpstreamName } from './log';
 import type { TrainingRequest } from './payload';
 import type { TrainingKeySource } from './secrets';
@@ -38,8 +38,6 @@ const TRASH = '\\Trash';
 const FLAGGED = '\\flagged';
 /** Message metadata JSON can contain parsed text/HTML; bound what is buffered. */
 const MAX_JSON_BYTES = 32 * 1024 * 1024;
-/** Enough of an error body to recognise Rspamd's "already learned" text (never logged). */
-const MAX_ERROR_PEEK_BYTES = 4096;
 const OBJECT_ID = /^[0-9a-f]{24}$/;
 
 const trained = (outcome = 'trained'): Decision => ({ status: 200, action: 'trained', outcome, level: 'info' });
@@ -110,7 +108,7 @@ export class Trainer {
 
     async train(request: TrainingRequest, deadline: Deadline, log: Logger): Promise<Decision> {
         try {
-            const key = await this.options.trainingKey.get();
+            const key = await this.options.trainingKey.get(deadline.signal);
             if (!key) {
                 return retry('training_key_unavailable', 503);
             }
@@ -259,7 +257,21 @@ class TrainingRun {
         return body;
     }
 
-    /** Streams the raw message through the header stripper into the learn endpoint. */
+    /** Maps a failure to open or stream the message to a decision. */
+    private streamFailure(failure: StripFailure | undefined): Decision | undefined {
+        switch (failure) {
+            case 'message_too_large': return skipped('too_large');
+            case 'header_too_large': return skipped('header_too_large');
+            case 'malformed_message': return skipped('malformed_message');
+            case 'source_error': return this.deadline.expired() ? retry('timeout', 503) : retry('eml_read_failed');
+            default: return undefined;
+        }
+    }
+
+    /**
+     * Reads and validates the whole header section of the raw message, then streams
+     * the normalized message into the learn endpoint. A malformed message is never sent.
+     */
     private async learn(endpoint: 'learn-spam' | 'learn-ham'): Promise<Decision> {
         const eml = await this.call('eml', `${this.base}/messages/${this.request.uid}/message.eml`, { method: 'GET', headers: { Accept: 'message/rfc822' } }, this.deadline.signal);
         await this.checkLookupStatus('eml', eml);
@@ -269,23 +281,23 @@ class TrainingRun {
             return skipped('too_large');
         }
         const source = eml.body ?? new ReadableStream<Uint8Array>({ start: controller => controller.close() });
-        const stripped: StrippedBody = createStrippedBody(source);
+        const opened = await openStrippedBody(source, { signal: this.deadline.signal });
+        if (!opened.ok) {
+            if (opened.malformed) {
+                // A category code only; never content.
+                this.log.warn('message_malformed', { upstream: 'eml', reason: opened.malformed });
+            }
+            return this.streamFailure(opened.failure) ?? retry('eml_read_failed');
+        }
+        const stripped: StrippedBody = opened.body;
         try {
-            const strippedFailure = (): Decision | undefined => {
-                switch (stripped.failure()) {
-                    case 'message_too_large': return skipped('too_large');
-                    case 'header_too_large': return skipped('header_too_large');
-                    case 'source_error': return this.deadline.expired() ? retry('timeout', 503) : retry('eml_read_failed');
-                    default: return undefined;
-                }
-            };
             const response = await this.call('learn', `${this.options.learnBaseUrl}/${endpoint}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'message/rfc822' },
                 body: stripped.stream,
                 duplex: 'half',
-            }, this.deadline.signal, strippedFailure);
-            const failure = strippedFailure();
+            }, this.deadline.signal, () => this.streamFailure(stripped.failure()));
+            const failure = this.streamFailure(stripped.failure());
             if (failure) {
                 // The proxy answered after our own stream aborted (truncated upload); our reason is authoritative.
                 await discard(response);
@@ -298,31 +310,17 @@ class TrainingRun {
         }
     }
 
-    /** Maps the Rspamd controller answer (relayed by the proxy) to a decision. */
+    /**
+     * Maps the learn status (relayed by the proxy) to a decision. Only the status is
+     * used; the body is never read. Any 2xx means the message was handed off.
+     */
     private async learnResult(response: Response): Promise<Decision> {
         const status = response.status;
-        if (status === 208) {
-            await discard(response);
-            return { ...trained('already_learned'), action: 'skipped', reason: 'already_learned' };
-        }
-        if (status === 204) {
-            // Too few/many tokens, learn conditions denied, or passthrough result.
-            await discard(response);
-            return { ...skipped('not_learnable', 'info'), outcome: 'not_learnable' };
-        }
-        if (status >= 200 && status < 300) {
-            await discard(response);
-            return trained();
-        }
-        if (status === 404) {
-            // The SQLite learn cache reports a same-class repeat as 404; others are configuration problems.
-            const peek = await readCapped(response, MAX_ERROR_PEEK_BYTES).catch(() => undefined);
-            if (peek && /has been already learned as/.test(new TextDecoder().decode(peek))) {
-                return { ...trained('already_learned'), action: 'skipped', reason: 'already_learned' };
-            }
-            return skipped('learn_rejected');
-        }
         await discard(response);
+        if (status >= 200 && status < 300) {
+            // 208: already learned; 204: not learnable (token count, learn conditions). Log detail only.
+            return trained(status === 208 ? 'already_learned' : status === 204 ? 'not_learnable' : 'trained');
+        }
         if (status === 413) {
             return skipped('too_large');
         }

@@ -20,7 +20,7 @@ Training proxies (X-Mail-Training-Key)
   └─ https://spam.rungie.com/_mail-training/v1/learn-spam | learn-ham  (Rspamd controller)
 ```
 
-1. **Edge source-IP check.** A CloudFront Function (`cloudfront-js-2.0`, viewer-request) allows a request only if `event.viewer.ip` is in the allowlist. That field is CloudFront's own TCP connection address, so viewers cannot spoof it; `X-Forwarded-For` and similar headers are never read. Both sides are normalized before comparison. IPv4 octets drop leading zeros. IPv6 is lower-cased, has `::` expanded and leading zeros removed, and IPv4-mapped addresses compare as IPv4. As a result, every textual form of an address matches. Everything else gets a 403 from the edge and never reaches Lambda.
+1. **Edge source-IP check.** A CloudFront Function (`cloudfront-js-2.0`, viewer-request) allows a request only if `event.viewer.ip` is in the allowlist. That field is CloudFront's own TCP connection address, so viewers cannot spoof it; `X-Forwarded-For` and similar headers are never read. Both sides are normalized before comparison. The function normalizes the standard IPv4 and IPv6 text forms: IPv4 octets drop leading zeros; IPv6 is lower-cased, with `::` compression expanded, zero-padded groups accepted, embedded dotted IPv4 tails converted, and IPv4-mapped addresses compared as IPv4. Anything else, including zone IDs (`%eth0`), CIDR suffixes and out-of-range values, normalizes to nothing and never matches. Every viewer that does not match gets a 403 from the edge and never reaches Lambda.
    - **Path rule.** Only the exact URIs `/healthz` and `/readyz` skip the IP check. Every other URI needs an allowlisted viewer, however it is spelled: trailing slash, upper case, `//`, percent-encoding, dot segments. CloudFront forwards the same URI to the origin. Lambda routes on the exact raw path, so a request that skipped the IP check can only reach health or readiness. No path variant can reach the webhook route without passing the check.
 2. **Origin header.** CloudFront adds `X-Origin-Verify` to every origin request. Its value is a bootstrap-generated Secrets Manager secret, inserted through a CloudFormation dynamic reference, so the value never appears in a template, output or log. Three independent layers stop a viewer from supplying it:
    - CloudFront origin custom headers override any viewer header with the same name.
@@ -52,7 +52,9 @@ Processing order: origin verification, then route and method, then a 1 MiB body 
 
 All responses are small JSON with `cache-control: no-store`. **The service never returns 410**, because WildDuck deletes a webhook that answers 410 Gone. Every response passes through a central guard that rewrites a 410, and a test asserts this for upstream 410s at every step.
 
-WildDuck treats only 2xx as delivered. It retries five times with exponential backoff starting at 2 s, about 30 s in total, one delivery at a time and without a client timeout. The Lambda answers within its own deadline: at most 20 s, less when `context.getRemainingTimeInMillis()` is lower, with a 3 s reserve. Every upstream call has an abort signal. A hung upstream yields a clean 503, not a Lambda timeout.
+WildDuck treats only 2xx as delivered. It makes 5 delivery attempts in total (1 initial attempt and 4 retries) with exponential backoff starting at 2 s, about 30 s of cumulative backoff, one delivery at a time and without a client timeout.
+
+One request deadline bounds the whole invocation. It is created when the invocation starts, before origin verification: 20 s, or `context.getRemainingTimeInMillis()` minus a 3 s response reserve when that is lower. Origin-secret and training-key loads, every upstream call and the message download and upload all abort at that deadline, so the total time to a response is bounded by it. A hung upstream or secret load yields a clean 503, not a Lambda timeout.
 
 ## Training logic
 
@@ -61,31 +63,33 @@ The proxies are reached with `redirect: 'error'` and exactly one credential, `X-
 **`marked.spam`**
 1. Fetch the mailbox.
 2. Continue only if `specialUse` is exactly `\Junk`; otherwise answer `ignored`.
-3. Stream the raw message through the header stripper into `learn-spam`.
+3. Read and validate the raw message's header section, then stream the normalized message into `learn-spam` (see [Header normalization](#header-normalization)).
 
 **`marked.ham`** WildDuck also emits this event when a message is merely starred, so the event alone is not a ham signal.
 1. Fetch the mailbox. Ignore the event if it is `\Junk` or `\Trash`.
 2. Fetch the message state. Require the returned `user`, `mailbox` and `id` to equal the event's values.
 3. Ignore the event if `flagged` is true or `flags` contains `\Flagged` (case-insensitive).
-4. Stream the raw message through the stripper into `learn-ham`.
+4. Read and validate the raw message's header section, then stream the normalized message into `learn-ham`.
+
+**Learn hand-off semantics.** The service is a pipeline between WildDuck and Rspamd: its job is to hand the message off correctly, not to judge whether Rspamd used it. The learn response is classified by HTTP status only. Its body is never read; it is cancelled so the connection is released. Any 2xx (200, 204, 208, …) means the message was handed off and is answered 200 `{"action":"trained"}`. Rspamd's 208 (already learned) and 204 (not learnable: too few or too many tokens, learn conditions) appear only as the logged outcomes `already_learned` and `not_learnable`. An error status where a later attempt can help (408, 425, 429, 5xx, and 401/403, which mean a misconfigured key) is answered 502 so WildDuck retries; every other 4xx (400, 404, 413, 415, 422, …) is permanent, so it is answered 200 `skipped` with a warning, because retrying cannot help.
 
 | Condition | Response to WildDuck | Log level |
 |---|---|---|
-| Learned (2xx) | 200 `{"action":"trained"}` | info |
-| Rspamd 208 "already learned", or 404 carrying the SQLite learn-cache "has been already learned as" text | 200 `{"action":"skipped","reason":"already_learned"}` | info |
-| Rspamd 204: too few or too many tokens, learn conditions denied, passthrough result | 200 `skipped`/`not_learnable` | info |
+| Learn 2xx (any) | 200 `{"action":"trained"}`; logged outcome `trained`, or `already_learned` (208) / `not_learnable` (204) | info |
 | 404 from mailbox, message or `.eml` (moved or deleted since the event) | 200 `skipped`/`stale` | info |
 | Not Junk / in Junk or Trash / flagged | 200 `ignored` with a reason | info |
 | Identity mismatch | 200 `skipped`/`identity_mismatch` | warn |
-| Message over 25 MiB (`size`, `Content-Length` or counted while streaming), header section over 1 MiB, learn 413 | 200 `skipped`/`too_large` or `header_too_large` | warn |
-| Other permanent 4xx from the proxies | 200 `skipped`/`upstream_rejected` or `learn_rejected` | warn |
-| Network error, 5xx, 408, 425, 429, 200 without `success: true`, malformed state | 502 (WildDuck retries) | error |
-| Proxy 401/403 (key misconfigured; the cached key is reloaded) | 502 `proxy_auth_failed` | error |
-| Timeout or deadline, training key unavailable | 503 | error |
+| Malformed message (see [Header normalization](#header-normalization)); the learn endpoint is never called | 200 `skipped`/`malformed_message` | warn |
+| Message over 25 MiB (`size`, `Content-Length` or counted while streaming), or learn 413 | 200 `skipped`/`too_large` | warn |
+| Header section over 1 MiB; the learn endpoint is never called | 200 `skipped`/`header_too_large` | warn |
+| Other permanent 4xx: lookups (`upstream_rejected`) or learn, e.g. 400, 404, 415, 422 (`learn_rejected`) | 200 `skipped` with that reason | warn |
+| Network error, 5xx, 408, 425, 429 (`upstream_unreachable` / `upstream_unavailable`); a lookup 200 without `success: true` or with malformed state; `.eml` read failure | 502 `retry` (WildDuck retries) | error |
+| Proxy 401/403 on any request (key misconfigured; the cached key is reloaded) | 502 `retry`/`proxy_auth_failed` | error |
+| Timeout or request deadline, training key unavailable | 503 `retry` | error |
 
-**Rspamd learn responses.** These come from the controller source in Rspamd 3.14 and 4.x (`src/controller.c` and `src/libstat/stat_process.c`). The stat-layer error code becomes the HTTP status, and the body is `{"error":"…"}`. Success is 200 `{"success":true}`. A same-class repeat is 208 with the Redis learn cache (the default since 1.8.3) and 404 with the SQLite cache. A message previously learned as the opposite class is unlearned and relearned automatically, and returns 200. Unlearnable messages return 204. A bad Rspamd password is 401.
+**Rspamd learn responses.** These come from the controller source in Rspamd 3.14 and 4.x (`src/controller.c` and `src/libstat/stat_process.c`). The stat-layer error code becomes the HTTP status. Success is 200. A same-class repeat is 208 with the Redis learn cache (the default since 1.8.3) and 404 with the SQLite cache, which this service treats as an ordinary permanent 404. A message previously learned as the opposite class is unlearned and relearned automatically, and returns 200. Unlearnable messages return 204. A bad Rspamd password is 401.
 
-**No dedup database.** Rspamd's Bayes learn cache recognizes same-class repeats (208) and relearns opposite-class messages. Duplicate deliveries, such as WildDuck retries after a lost response, are therefore expected and safe.
+**No dedup database.** Rspamd's Bayes learn cache recognizes same-class repeats and relearns opposite-class messages. Duplicate deliveries, such as WildDuck retries after a lost response, are therefore expected and safe.
 
 ### Proxy API contract
 
@@ -102,12 +106,21 @@ The learn requests send `Content-Type: message/rfc822` and a chunked streaming b
 
 ### Header normalization
 
-The raw message is piped through a byte-level transform into the learn request body (`duplex: 'half'`). The transform never decodes or re-encodes bytes. Only the header section is buffered, capped at 1 MiB. It removes these fields, matching names case-insensitively, together with all of their folded continuation lines:
+**Principle: reconstruct the message as it was when Rspamd originally scanned it.** Only header fields that our own pipeline adds after the scan are removed. Every header field that was, or may have been, present at scan time is preserved byte for byte, and so is the body. When unsure, preserve. A message that looks malformed is not trained at all, so Bayes never learns from doubtful data.
 
-- `WD-Mail-Classification`, `WD-Mail-Classification-Source`, `WD-Mail-Classification-Info`
-- any `X-Rspamd-*`, `X-Spamd-*` or `X-Spam-*`
+The raw message passes through a byte-level transform (`src/header-strip.ts`) into the learn request body (`duplex: 'half'`). The transform never decodes, re-encodes, reorders or re-folds anything. The header section is read, buffered (capped at 1 MiB) and validated before the learn request starts; the body then streams through without buffering. The rules:
 
-Everything else is preserved byte for byte: `Received`, `Received-SPF`, `Authentication-Results`, `DKIM-*` and `ARC-*`, field order, original CRLF / LF / mixed line endings, the blank separator line and the body. A body line that looks like a header survives. Tests split the input at every byte offset and at seeded random chunkings and require identical output.
+1. **Post-scan fields, removed wherever they appear.** These exact names (`POST_SCAN_HEADER_NAMES`), matched case-insensitively and also with whitespace before the colon (`X-Rspamd-Score : 1`), are removed together with their folded continuation lines:
+   - `X-Rspamd-Bar`, `X-Rspamd-Report`, `X-Rspamd-Score`: added by Haraka after the scan.
+   - `WD-Mail-Classification`, `WD-Mail-Classification-Source`, `WD-Mail-Classification-Info`: the only three fields WildDuck adds (`lib/filter-handler.js`).
+2. **Leading delivery fields, removed by position.** WildDuck prepends exactly two lines to every stored message after the scan, `Delivered-To: …` then `Return-Path: <…>`, after first stripping any leading ones. They are removed only while they are the leading header fields: if the first field is `Delivered-To` or `Return-Path`, it is removed with its continuation lines, and if the next field is the other one of the two, it is removed too (either order, at most one of each). A `Delivered-To` or `Return-Path` anywhere later in the header block is preserved. A message that does not start with them loses nothing.
+3. **Malformed messages are skipped.** The learn endpoint is not called, the download is cancelled, and WildDuck gets 200 `{"action":"skipped","reason":"malformed_message"}` with a warn-level `message_malformed` log line that carries only a category code (`reason`). A message is malformed when its header section contains a bare CR (`bare_cr`, a CR not immediately followed by LF) or a NUL byte (`nul`); a line that is neither a field start (a field name of bytes 33–126 except `:`, optional spaces or tabs, then `:`) nor a continuation line after a field (`invalid_line`); a continuation line before any field (`leading_continuation`); or an mbox `From ` envelope line (`mbox_envelope`); or when the message is empty (`empty`). Lines are validated in order as they arrive, so a malformed message is refused without reading the rest. A header line that ends beyond 1 MiB is `header_too_large` instead.
+
+Valid and unchanged: CRLF, bare LF and mixed line endings; a message with headers but no blank line or body; 8-bit bytes in header values; very long lines. After the header section the body passes through byte-identical, whatever it contains; a body line that looks like a removable header survives. The output of a valid message is the original bytes minus exactly the removed fields.
+
+**Headers deliberately preserved.** `X-Original-Rcpt`, `BIMI-Location` and `BIMI-Indicator` are added by the Haraka WildDuck plugin; whether that happens before or after the Rspamd scan depends on Haraka plugin order, so they are preserved. Third-party `X-Spam-*` fields and `X-Rspamd-*` fields other than the three listed (for example `X-Spam-Status`, `X-Spam-Flag`, `X-Spamd-Result`, `X-Rspamd-Queue-Id`, `X-Rspamd-Server`), `WD-Mail-Classification-Other` and other look-alikes are preserved, because they may have been present at scan time. So are `Received`, `Received-SPF`, `Authentication-Results`, `DKIM-*` and `ARC-*`.
+
+Tests compare the streaming transform against an independent whole-buffer reference implementation: split at every byte offset, one byte at a time, and thousands of seeded random messages (valid, malformed and oversized) with random chunkings.
 
 ## Logging
 
@@ -115,7 +128,7 @@ Logs are single-line JSON on stdout, never `console.*`. A typed allowlist valida
 
 - request id, delivery `id`, `ev`, `user`, `mailbox` and uid
 - route, method and status
-- outcome and reason
+- outcome and reason (for a malformed message, only its category code)
 - upstream name, upstream status and duration
 - byte count and the number of removed header fields
 
@@ -132,7 +145,7 @@ bun run package    # serverless package with placeholders (needs a Serverless Fr
 bun run test:release
 ```
 
-Tests inject `fetch`, SSM and Secrets Manager doubles and make no network calls. The smoke test runs the built artifact under Node 26. It checks the production wiring's fail-closed behavior without AWS calls, then runs one full spam-training pass through Node's real `fetch` and streams against a loopback-only stand-in.
+Tests inject `fetch`, SSM and Secrets Manager doubles and make no network calls. The smoke test runs the built artifact under Node 26. It checks the production wiring's fail-closed behavior without AWS calls, then runs one full spam-training pass and one malformed-message skip through Node's real `fetch` and streams against a loopback-only stand-in.
 
 ## Deployment and bootstrap
 
@@ -225,7 +238,7 @@ curl -sS -X POST -H 'Content-Type: application/json' --data '{"ev":"integration.
   https://wildduck-spam-training.rungie.com/hooks/wildduck
 ```
 
-Next, choose a dedicated test message that is already in a test account's Junk folder. Post a `marked.spam` for its user, mailbox and UID. Expect `{"action":"trained"}`, or `already_learned` on a repeat. Then check the structured logs (see [Monitoring](#monitoring)).
+Next, choose a dedicated test message that is already in a test account's Junk folder. Post a `marked.spam` for its user, mailbox and UID. Expect `{"action":"trained"}`; on a repeat the logged outcome is `already_learned`. Then check the structured logs (see [Monitoring](#monitoring)).
 
 **7. Register the WildDuck webhook.** Do this only after steps 1–6. It needs an administrator access token with `createAny` permission on `webhooks`. Keep the token in a root-only header file containing the line `X-Access-Token: <token>`, so the token is never on a command line. Omitting `user` registers the webhook for all users.
 

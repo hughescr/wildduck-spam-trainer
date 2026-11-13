@@ -82,7 +82,7 @@ describe('CloudFront viewer-request function (from the template)', () => {
     });
 
     test('every other address is rejected at the edge with 403', () => {
-        for (const ip of ['54.71.178.95', '54.71.178.9', '154.71.178.94', '2600:1f14:e8d:b300:9114:71e8:b97:39d', '2600:1f14:e8d:b300::', '::', '::1', '0.0.0.0', '127.0.0.1', '', 'not-an-ip', '54.71.178.94.1', '54.71.178.256', '1:2:3:4:5:6:7:8:9', '1::2::3', 'g::1', '54.71.178.94/32', undefined, null, 42]) {
+        for (const ip of ['54.71.178.95', '54.71.178.9', '154.71.178.94', '2600:1f14:e8d:b300:9114:71e8:b97:39d', '2600:1f14:e8d:b300::', '::', '::1', '0.0.0.0', '127.0.0.1', '', 'not-an-ip', '54.71.178.94.1', '54.71.178.256', '1:2:3:4:5:6:7:8:9', '1::2::3', 'g::1', '54.71.178.94/32', '2600:1f14:e8d:b300:9114:71e8:b97:39c%eth0', '2600:1f14:e8d:b300:9114:71e8:b97:39c%25eth0', '::ffff:54.71.178.94%1', '54.71.178.94%1', undefined, null, 42]) {
             const result = handler(viewerEvent(ip));
             expect(result.statusCode).toBe(403);
             expect(result.headers?.['cache-control']).toEqual({ value: 'no-store' });

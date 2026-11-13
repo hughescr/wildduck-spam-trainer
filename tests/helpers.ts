@@ -19,7 +19,10 @@ export const MESSAGE_ID = '<msgid-marker-77@example.org>';
 export const BODY_MARKER = 'BODY-CONTENT-MARKER';
 export const SENSITIVE = [KEY, ORIGIN_SECRET, SUBJECT, ADDRESS, MESSAGE_ID, BODY_MARKER, 'msgid-marker', 'alice.marker', 'Subject-Marker'];
 
+/** As WildDuck stores it: leading delivery fields, then the message with post-scan fields mixed in. */
 export const RAW_MESSAGE = [
+    `Delivered-To: ${ADDRESS}\r\n`,
+    `Return-Path: <${ADDRESS}>\r\n`,
     'Received: from mx.example.org (mx.example.org [192.0.2.1])\r\n\tby mail.rungie.com; Mon, 1 Jan 2026 00:00:00 +0000\r\n',
     'X-Spam-Flag: YES\r\n',
     'X-Rspamd-Score: 15.2\r\n\t(folded continuation)\r\n',
@@ -28,15 +31,17 @@ export const RAW_MESSAGE = [
     `Message-ID: ${MESSAGE_ID}\r\n`,
     'WD-Mail-Classification: spam\r\n',
     '\r\n',
-    `${BODY_MARKER}\r\nX-Spam-Flag: YES\r\n`,
+    `${BODY_MARKER}\r\nX-Rspamd-Score: 1\r\n`,
 ].join('');
+/** RAW_MESSAGE minus the four removed fields (Delivered-To, Return-Path, X-Rspamd-Score, WD-Mail-Classification). */
 export const STRIPPED_MESSAGE = [
     'Received: from mx.example.org (mx.example.org [192.0.2.1])\r\n\tby mail.rungie.com; Mon, 1 Jan 2026 00:00:00 +0000\r\n',
+    'X-Spam-Flag: YES\r\n',
     `From: ${ADDRESS}\r\n`,
     `Subject: ${SUBJECT}\r\n`,
     `Message-ID: ${MESSAGE_ID}\r\n`,
     '\r\n',
-    `${BODY_MARKER}\r\nX-Spam-Flag: YES\r\n`,
+    `${BODY_MARKER}\r\nX-Rspamd-Score: 1\r\n`,
 ].join('');
 
 export function webhookBody(overrides: Record<string, unknown> = {}): string {
@@ -78,7 +83,7 @@ export type Route = (call: RecordedCall) => Response | Promise<Response>;
 const jsonResponse = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 export const mailboxResponse = (specialUse: string | null, id = MAILBOX) => jsonResponse(200, { success: true, id, path: specialUse ? specialUse.slice(1) : 'INBOX', specialUse });
 export const messageResponse = (overrides: Record<string, unknown> = {}) => jsonResponse(200, { success: true, id: UID, mailbox: MAILBOX, user: USER, size: RAW_MESSAGE.length, flagged: false, flags: ['\\Seen'], subject: SUBJECT, from: { address: ADDRESS }, messageId: MESSAGE_ID, ...overrides });
-export const emlResponse = (raw: string | ReadableStream<Uint8Array> = RAW_MESSAGE, headers: Record<string, string> = {}) => new Response(raw, { status: 200, headers: { 'content-type': 'message/rfc822', ...headers } });
+export const emlResponse = (raw: string | Uint8Array<ArrayBuffer> | ReadableStream<Uint8Array> = RAW_MESSAGE, headers: Record<string, string> = {}) => new Response(raw, { status: 200, headers: { 'content-type': 'message/rfc822', ...headers } });
 export const status = (code: number, body = `{"error":"${SUBJECT} ${ADDRESS}"}`) => new Response(code === 204 ? null : body, { status: code });
 export { jsonResponse };
 

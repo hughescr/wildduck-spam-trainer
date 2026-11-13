@@ -4,9 +4,10 @@ export const MAX_REQUEST_MS = 20_000;
 export const RESPONSE_RESERVE_MS = 3_000;
 
 /**
- * A request-wide deadline. Every upstream call derives its signal from it, so
- * the handler returns a clean retryable response instead of being killed by
- * the Lambda timeout.
+ * A request-wide deadline, created when the invocation starts (before origin
+ * verification). Secret loads and every upstream call derive their signal from
+ * it, so the handler returns a clean response within it instead of being killed
+ * by the Lambda timeout.
  */
 export class Deadline {
     readonly signal: AbortSignal;

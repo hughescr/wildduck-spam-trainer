@@ -1,6 +1,6 @@
 // Smoke test of the built artifact under Node 26: fail-closed behaviour of the production
-// wiring (no AWS calls), then one full spam-training pass through Node's real fetch and
-// streams against a loopback-only stand-in for the proxies.
+// wiring (no AWS calls), then one full spam-training pass and one malformed-message skip
+// through Node's real fetch and streams against a loopback-only stand-in for the proxies.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 
@@ -28,8 +28,10 @@ const USER = 'a'.repeat(24);
 const MAILBOX = 'b'.repeat(24);
 const KEY = 'smoke-training-key-0123456789';
 const body = Buffer.alloc(3 * 1024 * 1024, 'x');
-const raw = Buffer.concat([Buffer.from('Received: from a\r\nX-Spam-Flag: YES\r\nX-Rspamd-Score: 9\r\n\tcontinued\r\nSubject: smoke\r\n\r\n'), body]);
-const expected = Buffer.concat([Buffer.from('Received: from a\r\nSubject: smoke\r\n\r\n'), body]);
+const raw = Buffer.concat([Buffer.from('Delivered-To: a@example.org\r\nReturn-Path: <b@example.org>\r\nReceived: from a\r\nX-Spam-Flag: YES\r\nX-Rspamd-Score: 9\r\n\tcontinued\r\nSubject: smoke\r\nWD-Mail-Classification: spam\r\n\r\n'), body]);
+const expected = Buffer.concat([Buffer.from('Received: from a\r\nX-Spam-Flag: YES\r\nSubject: smoke\r\n\r\n'), body]);
+const malformed = Buffer.concat([Buffer.from('Subject: smoke\r\nnot a header line\r\n\r\n'), body]);
+let message = raw;
 let learned;
 const seen = [];
 const server = createServer((req, res) => {
@@ -40,7 +42,7 @@ const server = createServer((req, res) => {
         res.end(JSON.stringify({ success: true, id: MAILBOX, path: 'Junk', specialUse: '\\Junk' }));
     } else if (req.url === `${base}/messages/7/message.eml`) {
         res.setHeader('content-type', 'message/rfc822');
-        res.end(raw);
+        res.end(message);
     } else if (req.url === '/learn/learn-spam' && req.method === 'POST') {
         const parts = [];
         req.on('data', chunk => parts.push(chunk));
@@ -68,7 +70,8 @@ try {
     const health = await app(event('/healthz', { headers: { 'x-origin-verify': SECRET } }));
     assert.equal(health.statusCode, 200);
     assert.equal(JSON.parse(health.body).service, 'wildduck-spam-trainer');
-    const result = await app(event('/hooks/wildduck', { method: 'POST', headers: { 'x-origin-verify': SECRET, 'content-type': 'application/json' }, body: JSON.stringify({ id: `${'c'.repeat(24)}:1`, ev: 'marked.spam', user: USER, mailbox: MAILBOX, message: 7 }) }), { getRemainingTimeInMillis: () => 25_000 });
+    const spamHook = () => app(event('/hooks/wildduck', { method: 'POST', headers: { 'x-origin-verify': SECRET, 'content-type': 'application/json' }, body: JSON.stringify({ id: `${'c'.repeat(24)}:1`, ev: 'marked.spam', user: USER, mailbox: MAILBOX, message: 7 }) }), { getRemainingTimeInMillis: () => 25_000 });
+    const result = await spamHook();
     assert.equal(result.statusCode, 200, result.body);
     assert.deepEqual(JSON.parse(result.body), { action: 'trained' });
     assert.ok(learned && learned.equals(expected), 'Learn endpoint must receive the header-stripped message byte-for-byte');
@@ -77,6 +80,13 @@ try {
         assert.equal(entry.key, KEY, 'Every proxy request carries the training key');
         assert.equal(entry.token, undefined, 'No proxy request carries X-Access-Token');
     }
+    // A malformed message is skipped without any learn request.
+    message = malformed;
+    seen.length = 0;
+    const skipped = await spamHook();
+    assert.equal(skipped.statusCode, 200, skipped.body);
+    assert.deepEqual(JSON.parse(skipped.body), { action: 'skipped', reason: 'malformed_message' });
+    assert.deepEqual(seen.map(entry => entry.url), [`/api/users/${USER}/mailboxes/${MAILBOX}`, `/api/users/${USER}/mailboxes/${MAILBOX}/messages/7/message.eml`], 'A malformed message never reaches the learn endpoint');
 } finally {
     server.close();
 }

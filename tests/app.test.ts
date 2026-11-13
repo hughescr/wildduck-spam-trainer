@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { MAX_BODY_BYTES, neverGone, SERVICE_VERSION, type HttpResult } from '../src/app';
-import { buildApp, event, hook, jsonResponse, mailboxResponse, ORIGIN_SECRET, parse, spamRoutes, staticOrigin, webhookBody, FakeKey, emlResponse } from './helpers';
+import { OriginVerifier } from '../src/secrets';
+import { buildApp, captureLogs, event, hook, jsonResponse, mailboxResponse, ORIGIN_SECRET, parse, spamRoutes, staticOrigin, webhookBody, FakeKey, emlResponse } from './helpers';
 import packageJson from '../package.json';
 
 const expectJsonNoStore = (result: HttpResult) => {
@@ -35,6 +36,45 @@ describe('origin verification precedes everything', () => {
         for (const request of [event('/healthz'), hook()]) {
             expect((await app(request)).statusCode).toBe(503);
         }
+        expect(calls).toHaveLength(0);
+    });
+
+    test('one request deadline, created before origin verification, governs every later step', async () => {
+        let originSignal: AbortSignal | undefined;
+        let keySignal: AbortSignal | undefined;
+        const key = new FakeKey();
+        key.get = async (signal?: AbortSignal) => { keySignal = signal; return key.value ?? undefined; };
+        const { app, calls } = buildApp({ key, routes: spamRoutes(), origin: { verify: async (value, signal) => { originSignal = signal; return value === ORIGIN_SECRET ? 'ok' : 'mismatch'; } } });
+        expect(parse(await app(hook(), { getRemainingTimeInMillis: () => 25_000 }))).toEqual({ action: 'trained' });
+        expect(originSignal).toBeInstanceOf(AbortSignal);
+        expect(keySignal).toBe(originSignal);
+        // The .eml download and the learn upload use the request deadline's signal directly.
+        expect(calls[1]?.signal).toBe(originSignal);
+        expect(calls[2]?.signal).toBe(originSignal);
+    });
+
+    test('time spent verifying the origin counts against the request deadline', async () => {
+        const hang = (call: { signal: AbortSignal }) => new Promise<Response>((_resolve, reject) => call.signal.addEventListener('abort', () => reject(call.signal.reason), { once: true }));
+        const { app } = buildApp({ routes: spamRoutes({ mailbox: hang }), origin: { verify: async () => { await Bun.sleep(300); return 'ok'; } } });
+        const started = Date.now();
+        // 3.4 s remaining minus the 3 s reserve: a 400 ms budget for the whole request.
+        const result = await app(hook(), { getRemainingTimeInMillis: () => 3_400 });
+        expect(result.statusCode).toBe(503);
+        expect(parse(result)).toEqual({ action: 'retry', reason: 'timeout' });
+        // A deadline started after verification would end at about 700 ms.
+        expect(Date.now() - started).toBeLessThan(650);
+    });
+
+    test('a hanging origin-secret load is cut off by the request deadline (fail closed, 503)', async () => {
+        const logs = captureLogs();
+        const hanging = { send: (_command: unknown, options?: { abortSignal?: AbortSignal }) => new Promise<never>((_resolve, reject) => options?.abortSignal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })) };
+        const origin = new OriginVerifier({ client: () => hanging, secretId: 'wildduck-spam-trainer/prod/origin-verify-key', log: logs.log, timeoutMs: 10_000 });
+        const { app, calls } = buildApp({ routes: spamRoutes(), origin });
+        const started = Date.now();
+        const result = await app(hook(), { getRemainingTimeInMillis: () => 3_200 });
+        expect(result.statusCode).toBe(503);
+        expect(parse(result)).toEqual({ error: 'unavailable' });
+        expect(Date.now() - started).toBeLessThan(2_000);
         expect(calls).toHaveLength(0);
     });
 

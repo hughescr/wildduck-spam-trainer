@@ -1,8 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import { MAX_MESSAGE_BYTES } from '../src/header-strip';
 import {
-    buildApp, emlResponse, FakeKey, hamHook, hamRoutes, hook, jsonResponse, KEY, LEARN, mailboxResponse, messageResponse, parse,
-    RAW_MESSAGE, SENSITIVE, spamRoutes, status, STRIPPED_MESSAGE, UID, USER, MAILBOX, webhookBody, type Routes,
+    ADDRESS, BODY_MARKER, buildApp, emlResponse, FakeKey, hamHook, hamRoutes, hook, jsonResponse, KEY, LEARN, mailboxResponse, messageResponse, parse,
+    RAW_MESSAGE, SENSITIVE, spamRoutes, status, STRIPPED_MESSAGE, SUBJECT, UID, USER, MAILBOX, webhookBody, type Routes,
 } from './helpers';
 
 const text = (bytes: Uint8Array | undefined) => new TextDecoder().decode(bytes);
@@ -188,59 +188,79 @@ describe('learn outcomes', () => {
         return { result, body: parse(result), ...harness };
     };
 
-    test('2xx is trained', async () => {
-        for (const code of [200, 201, 202]) {
-            const { body } = await outcome(() => status(code, '{"success":true}'));
-            expect(body).toEqual({ action: 'trained' });
-        }
+    const trainedAs = (outcome: string) => ({ webhook: 200, body: { action: 'trained' }, outcome, level: 'info' });
+    const skippedAs = (reason: string) => ({ webhook: 200, body: { action: 'skipped', reason }, outcome: 'skipped', level: 'warn' });
+    const retriedAs = (reason: string, webhook = 502) => ({ webhook, body: { action: 'retry', reason }, outcome: 'retry', level: 'error' });
+    /** Learn status classification: the status alone decides; the body is never read. */
+    const STATUS_TABLE: [number, ReturnType<typeof trainedAs>][] = [
+        [200, trainedAs('trained')],
+        [201, trainedAs('trained')],
+        [202, trainedAs('trained')],
+        [204, trainedAs('not_learnable')],
+        [206, trainedAs('trained')],
+        [208, trainedAs('already_learned')],
+        [400, skippedAs('learn_rejected')],
+        [404, skippedAs('learn_rejected')],
+        [405, skippedAs('learn_rejected')],
+        [409, skippedAs('learn_rejected')],
+        [413, skippedAs('too_large')],
+        [415, skippedAs('learn_rejected')],
+        [422, skippedAs('learn_rejected')],
+        [401, retriedAs('proxy_auth_failed')],
+        [403, retriedAs('proxy_auth_failed')],
+        [408, retriedAs('upstream_unavailable')],
+        [425, retriedAs('upstream_unavailable')],
+        [429, retriedAs('upstream_unavailable')],
+        [500, retriedAs('upstream_unavailable')],
+        [502, retriedAs('upstream_unavailable')],
+        [503, retriedAs('upstream_unavailable')],
+        [504, retriedAs('upstream_unavailable')],
+    ];
+
+    for (const [code, expected] of STATUS_TABLE) {
+        test(`learn HTTP ${code} → webhook ${expected.webhook} ${JSON.stringify(expected.body)} (${expected.level})`, async () => {
+            for (const ev of ['marked.spam', 'marked.ham']) {
+                const { result, body, records, key } = await outcome(() => status(code), ev);
+                expect(result.statusCode).toBe(expected.webhook);
+                expect(body).toEqual(expected.body);
+                expect(records().find(record => record['event'] === 'request_completed')).toMatchObject({ outcome: expected.outcome, level: expected.level, status: expected.webhook });
+                expect(key.invalidations).toBe(code === 401 || code === 403 ? 1 : 0);
+            }
+        });
+    }
+
+    test('learn network error and timeout are retryable', async () => {
+        const network = await outcome(() => { throw new TypeError('fetch failed'); });
+        expect(network.result.statusCode).toBe(502);
+        expect(network.body).toEqual({ action: 'retry', reason: 'upstream_unreachable' });
+        const timeout = await outcome(() => { throw new DOMException('timed out', 'TimeoutError'); });
+        expect(timeout.result.statusCode).toBe(503);
+        expect(timeout.body).toEqual({ action: 'retry', reason: 'timeout' });
     });
 
-    test('208 already learned is a successful no-op with a distinct outcome', async () => {
-        const { result, body, records } = await outcome(() => status(208, '{"error":"<x@y> has been already learned as spam, ignore it"}'));
-        expect(result.statusCode).toBe(200);
-        expect(body).toEqual({ action: 'skipped', reason: 'already_learned' });
-        expect(records().find(record => record['event'] === 'request_completed')?.['outcome']).toBe('already_learned');
-    });
-
-    test('404 with the SQLite-cache "already learned" text is also already_learned', async () => {
-        const { body } = await outcome(() => status(404, '{"error":"<x@y> has been already learned as ham, ignore it"}'), 'marked.ham');
-        expect(body).toEqual({ action: 'skipped', reason: 'already_learned' });
-    });
-
-    test('204 (too few tokens, learn conditions) is a not_learnable no-op', async () => {
-        const { result, body, records } = await outcome(() => status(204));
-        expect(result.statusCode).toBe(200);
-        expect(body).toEqual({ action: 'skipped', reason: 'not_learnable' });
-        const completed = records().find(record => record['event'] === 'request_completed');
-        expect(completed?.['outcome']).toBe('not_learnable');
-        expect(completed?.['level']).toBe('info');
-    });
-
-    test('413 is a permanent too_large skip', async () => {
-        const { body, records } = await outcome(() => status(413));
-        expect(body).toEqual({ action: 'skipped', reason: 'too_large' });
-        expect(records().find(record => record['event'] === 'request_completed')?.['level']).toBe('warn');
-    });
-
-    test('other permanent 4xx are skipped with a warning', async () => {
-        for (const code of [400, 404, 405, 422]) {
-            const { result, body, records } = await outcome(() => status(code));
+    test('the 2xx learn body is never inspected: a 200 {"success":false} is a successful hand-off', async () => {
+        for (const raw of ['{"success":false}', `{"success":false,"error":"${SUBJECT}"}`, '{"error":"x"}', 'not json', '']) {
+            const { result, body, records } = await outcome(() => status(200, raw));
             expect(result.statusCode).toBe(200);
-            expect(body).toEqual({ action: 'skipped', reason: 'learn_rejected' });
-            expect(records().find(record => record['event'] === 'request_completed')?.['level']).toBe('warn');
+            expect(body).toEqual({ action: 'trained' });
+            expect(records().find(record => record['event'] === 'request_completed')).toMatchObject({ outcome: 'trained', level: 'info' });
         }
+        // A 404 carrying the "already learned" text is just a permanent 404.
+        const { body } = await outcome(() => status(404, '{"error":"<x@y> has been already learned as ham, ignore it"}'), 'marked.ham');
+        expect(body).toEqual({ action: 'skipped', reason: 'learn_rejected' });
     });
 
-    test('learn 401/403 is retryable proxy_auth_failed; 5xx and 429 are retryable', async () => {
-        for (const code of [401, 403]) {
-            const { result, body, key } = await outcome(() => status(code));
-            expect(result.statusCode).toBe(502);
-            expect(body).toEqual({ action: 'retry', reason: 'proxy_auth_failed' });
-            expect(key.invalidations).toBe(1);
-        }
-        for (const code of [408, 425, 429, 500, 503]) {
-            const { result } = await outcome(() => status(code));
-            expect(result.statusCode).toBe(502);
+    test('the learn response body is cancelled unread (socket released)', async () => {
+        for (const code of [200, 208, 400, 503]) {
+            let pulled = 0;
+            let cancelled = false;
+            const endless = new ReadableStream<Uint8Array>({
+                pull(controller) { pulled++; controller.enqueue(new Uint8Array(1024).fill(0x20)); },
+                cancel() { cancelled = true; },
+            }, { highWaterMark: 0 });
+            await outcome(() => new Response(endless, { status: code }));
+            expect(pulled).toBe(0);
+            expect(cancelled).toBe(true);
         }
     });
 
@@ -263,10 +283,23 @@ describe('learn outcomes', () => {
         expect(produced).toBeLessThanOrEqual(27);
     });
 
-    test('a header section over 1 MiB is a permanent skip', async () => {
+    test('a header section over 1 MiB is a permanent skip without a learn request', async () => {
         const raw = `${'X-Long: '.padEnd(1024 * 1024 + 10, 'a')}\r\n\r\nbody`;
         const harness = buildApp({ routes: spamRoutes({ eml: () => emlResponse(raw) }) });
         expect(parse(await harness.app(hook()))).toEqual({ action: 'skipped', reason: 'header_too_large' });
+        expect(harness.calls.some(call => call.url.startsWith(LEARN))).toBe(false);
+    });
+
+    test('an eml read failure inside the header section is retryable and never reaches the learn endpoint', async () => {
+        const source = new ReadableStream<Uint8Array>({
+            start(controller) { controller.enqueue(new TextEncoder().encode('Subject: x\r\nTo: y')); },
+            pull(controller) { controller.error(new Error('connection reset')); },
+        });
+        const harness = buildApp({ routes: spamRoutes({ eml: () => emlResponse(source) }) });
+        const result = await harness.app(hook());
+        expect(result.statusCode).toBe(502);
+        expect(parse(result)).toEqual({ action: 'retry', reason: 'eml_read_failed' });
+        expect(harness.calls.some(call => call.url.startsWith(LEARN))).toBe(false);
     });
 
     test('an eml read failure mid-stream is retryable', async () => {
@@ -278,6 +311,67 @@ describe('learn outcomes', () => {
         const result = await harness.app(hook());
         expect(result.statusCode).toBe(502);
         expect(parse(result)).toEqual({ action: 'retry', reason: 'eml_read_failed' });
+    });
+});
+
+describe('malformed messages are skipped, never trained', () => {
+    const CASES: [string, string, string][] = [
+        ['bare CR in a field value', `Subject: ${SUBJECT}\rmore\r\n\r\n${BODY_MARKER}`, 'bare_cr'],
+        ['bare CR line ending', `Subject: a\r\rTo: b\r\n\r\n${BODY_MARKER}`, 'bare_cr'],
+        ['NUL in the header section', `Subject: a\u0000b\r\n\r\n${BODY_MARKER}`, 'nul'],
+        ['a line that is not a field', `Subject: a\r\nnot a header ${ADDRESS}\r\n\r\n${BODY_MARKER}`, 'invalid_line'],
+        ['space inside a field name', `Subject: a\r\nBad Name: x\r\n\r\n${BODY_MARKER}`, 'invalid_line'],
+        ['body without a blank separator', `Subject: a\nThis is body text ${BODY_MARKER}\n`, 'invalid_line'],
+        ['continuation before any field', ` folded\r\nSubject: a\r\n\r\n${BODY_MARKER}`, 'leading_continuation'],
+        ['mbox From envelope line', `From ${ADDRESS} Mon Jan  1 00:00:00 2026\r\nSubject: a\r\n\r\n${BODY_MARKER}`, 'mbox_envelope'],
+        ['empty message', '', 'empty'],
+    ];
+    for (const [name, raw, code] of CASES) {
+        test(`${name}: no learn request, 200 skipped/malformed_message, warn log with code ${code} only`, async () => {
+            for (const [routes, request] of [[spamRoutes({ eml: () => emlResponse(raw) }), hook()], [hamRoutes({ eml: () => emlResponse(raw) }), hamHook()]] as const) {
+                const { app, calls, records, lines } = buildApp({ routes });
+                const result = await app(request);
+                expect(result.statusCode).toBe(200);
+                expect(parse(result)).toEqual({ action: 'skipped', reason: 'malformed_message' });
+                expect(calls.filter(call => call.url.startsWith(LEARN))).toHaveLength(0);
+                expect(records().find(record => record['event'] === 'message_malformed')).toMatchObject({ level: 'warn', upstream: 'eml', reason: code });
+                expect(records().find(record => record['event'] === 'request_completed')).toMatchObject({ level: 'warn', outcome: 'skipped', reason: 'malformed_message', status: 200 });
+                const all = lines.join('\n');
+                for (const marker of SENSITIVE) {
+                    expect(all).not.toContain(marker);
+                }
+            }
+        });
+    }
+
+    test('the source is cancelled without reading the rest of the message', async () => {
+        let pulls = 0;
+        let cancelled = false;
+        const source = new ReadableStream<Uint8Array>({
+            start(controller) { controller.enqueue(new TextEncoder().encode('Subject: a\r\nbroken line\r\n')); },
+            pull(controller) { pulls++; controller.enqueue(new Uint8Array(64 * 1024).fill(0x61)); },
+            cancel() { cancelled = true; },
+        }, { highWaterMark: 0 });
+        const { app, calls } = buildApp({ routes: spamRoutes({ eml: () => emlResponse(source) }) });
+        expect(parse(await app(hook()))).toEqual({ action: 'skipped', reason: 'malformed_message' });
+        expect(calls.filter(call => call.url.startsWith(LEARN))).toHaveLength(0);
+        expect(cancelled).toBe(true);
+        expect(pulls).toBeLessThanOrEqual(1);
+    });
+
+    test('valid edge cases are trained with exact bytes', async () => {
+        const body = `${BODY_MARKER}\r\nX-Rspamd-Score: 9\r\n\u0000\r bare CR and NUL in the body are fine`;
+        for (const [raw, expected] of [
+            ['Delivered-To: a@b\nReturn-Path: <a@b>\nSubject: lf only\nX-Rspamd-Bar: +++\n\n' + body, 'Subject: lf only\n\n' + body],
+            ['Subject: mixed\nTo: x\r\nX-Spam-Flag: YES\n\r\n' + body, 'Subject: mixed\nTo: x\r\nX-Spam-Flag: YES\n\r\n' + body],
+            ['Subject: no body\r\nWD-Mail-Classification: spam\r\n', 'Subject: no body\r\n'],
+            ['Subject: no newline at all', 'Subject: no newline at all'],
+            [`Subject: 8-bit éÿ ${'v'.repeat(20_000)}\r\n\r\n${body}`, `Subject: 8-bit éÿ ${'v'.repeat(20_000)}\r\n\r\n${body}`],
+        ] as const) {
+            const { app, calls } = buildApp({ routes: spamRoutes({ eml: () => emlResponse(new Uint8Array(Buffer.from(raw, 'latin1'))) }) });
+            expect(parse(await app(hook()))).toEqual({ action: 'trained' });
+            expect(Buffer.from(calls[2]?.body ?? new Uint8Array(0)).equals(Buffer.from(expected, 'latin1'))).toBe(true);
+        }
     });
 });
 
@@ -307,6 +401,9 @@ describe('logging never leaks sensitive data', () => {
         ['eml 404', spamRoutes({ eml: () => status(404) }), 'spam'],
         ['learn 400', spamRoutes({ learn: () => status(400) }), 'spam'],
         ['learn 208', spamRoutes({ learn: () => status(208) }), 'spam'],
+        ['learn 200 error body', spamRoutes({ learn: () => status(200) }), 'spam'],
+        ['malformed header section', spamRoutes({ eml: () => emlResponse(`Subject: ${SUBJECT}\r\nNot a header ${SENSITIVE.join(' ')}\r\n\r\n`) }), 'spam'],
+        ['malformed bare CR', hamRoutes({ eml: () => emlResponse(`Subject: ${SUBJECT}\r${SENSITIVE.join(' ')}\r\n\r\n`) }), 'ham'],
         ['learn 401', hamRoutes({ learn: () => status(401) }), 'ham'],
         ['network', spamRoutes({ eml: () => { throw new TypeError(`fetch failed ${SENSITIVE.join(' ')}`); } }), 'spam'],
         ['eml stream error', spamRoutes({ eml: () => emlResponse(new ReadableStream({ pull(controller) { controller.error(new Error(SENSITIVE.join(' '))); } })) }), 'spam'],
@@ -344,6 +441,6 @@ describe('logging never leaks sensitive data', () => {
         expect(completed).toMatchObject({ requestId: 'req-1', deliveryId: '65a1b2c3d4e5f6a7b8c9d0e1:1', ev: 'marked.spam', user: USER, mailbox: MAILBOX, uid: UID, route: '/hooks/wildduck', method: 'POST', status: 200, outcome: 'trained' });
         const upstreams = records().filter(record => record['event'] === 'upstream_response').map(record => record['upstream']);
         expect(upstreams).toEqual(['mailbox', 'eml', 'learn']);
-        expect(records().find(record => record['event'] === 'message_streamed')).toMatchObject({ bytes: RAW_MESSAGE.length, removedHeaders: 3 });
+        expect(records().find(record => record['event'] === 'message_streamed')).toMatchObject({ bytes: RAW_MESSAGE.length, removedHeaders: 4 });
     });
 });

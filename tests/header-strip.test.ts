@@ -1,58 +1,157 @@
 import { describe, expect, test } from 'bun:test';
-import { createStrippedBody, HeaderSectionTooLarge, HeaderStripper, isStrippedHeaderName, MessageTooLarge, stripHeaders } from '../src/header-strip';
+import {
+    HeaderSectionTooLarge, HeaderStripper, isPostScanHeaderName, LEADING_DELIVERY_HEADER_NAMES, MalformedMessage, MAX_HEADER_SECTION_BYTES, MessageTooLarge,
+    openStrippedBody, POST_SCAN_HEADER_NAMES, stripHeaders, type HeaderStripperOptions, type MalformedReason,
+} from '../src/header-strip';
 
-const enc = (value: string) => new TextEncoder().encode(value);
-const dec = (value: Uint8Array) => new TextDecoder().decode(value);
-const strip = (value: string) => dec(stripHeaders(enc(value)));
+const latin1 = (value: string) => new Uint8Array(Buffer.from(value, 'latin1'));
+const text = (value: Uint8Array) => Buffer.from(value).toString('latin1');
+const strip = (value: string) => text(stripHeaders(latin1(value)));
 
-function chunked(input: Uint8Array, sizes: number[]): Uint8Array {
-    const stripper = new HeaderStripper();
-    const out: Uint8Array[] = [];
-    let offset = 0;
-    let index = 0;
-    while (offset < input.length) {
-        const size = Math.max(1, sizes[index++ % sizes.length] ?? 1);
-        out.push(...stripper.push(input.subarray(offset, offset + size)));
-        offset += size;
+type Outcome = Buffer | 'malformed' | 'header_too_large';
+
+function malformedReason(value: string): MalformedReason | undefined {
+    try {
+        stripHeaders(latin1(value));
+        return undefined;
+    } catch (error) {
+        if (error instanceof MalformedMessage) {
+            return error.reason;
+        }
+        throw error;
     }
-    out.push(...stripper.end());
+}
+
+/** Feeds `input` in chunks of the given sizes (cycled) and maps the result like the reference does. */
+function run(input: Uint8Array, sizes: readonly number[], options?: HeaderStripperOptions): Outcome {
+    const stripper = new HeaderStripper(options);
+    const out: Uint8Array[] = [];
+    try {
+        let offset = 0;
+        let index = 0;
+        while (offset < input.length) {
+            const size = Math.max(1, sizes[index++ % sizes.length] ?? 1);
+            out.push(...stripper.push(input.subarray(offset, offset + size)));
+            offset += size;
+        }
+        out.push(...stripper.end());
+    } catch (error) {
+        if (error instanceof MalformedMessage) {
+            return 'malformed';
+        }
+        if (error instanceof HeaderSectionTooLarge) {
+            return 'header_too_large';
+        }
+        throw error;
+    }
     return Buffer.concat(out);
 }
 
+const POST_SCAN = ['x-rspamd-bar', 'x-rspamd-report', 'x-rspamd-score', 'wd-mail-classification', 'wd-mail-classification-source', 'wd-mail-classification-info'];
+const LEADING = ['delivered-to', 'return-path'];
+
+/**
+ * Whole-buffer reference for every rule, written independently of the
+ * implementation: regular expressions over latin1 text of the complete input.
+ */
+function reference(input: Uint8Array, cap = MAX_HEADER_SECTION_BYTES): Outcome {
+    if (input.length === 0) {
+        return 'malformed';
+    }
+    const raw = text(input);
+    const blank = /(^|\n)\r?\n/.exec(raw);
+    const end = blank ? blank.index + (blank[1] ?? '').length : raw.length;
+    const fields: { name: string; text: string }[] = [];
+    let lineEnd = 0;
+    // Lines are judged in order; one that ends beyond the cap makes the section too large.
+    for (const line of raw.slice(0, end).match(/[^\n]*\n|[^\n]+$/g) ?? []) {
+        lineEnd += line.length;
+        if (lineEnd > cap) {
+            return 'header_too_large';
+        }
+        const content = line.replace(/\r?\n$/, '');
+        if (/[\r\0]/.test(content)) {
+            return 'malformed';
+        }
+        const last = fields.at(-1);
+        if (/^[ \t]/.test(content)) {
+            if (!last) {
+                return 'malformed';
+            }
+            last.text += line;
+            continue;
+        }
+        const field = /^([\x21-\x39\x3b-\x7e]+)[ \t]*:/.exec(content);
+        if (!field) {
+            return 'malformed';
+        }
+        fields.push({ name: (field[1] ?? '').toLowerCase(), text: line });
+    }
+    const drop = fields.map(field => POST_SCAN.includes(field.name));
+    const [first, second] = fields;
+    if (first && LEADING.includes(first.name)) {
+        drop[0] = true;
+        if (second && second.name !== first.name && LEADING.includes(second.name)) {
+            drop[1] = true;
+        }
+    }
+    return Buffer.from(fields.filter((_field, index) => !drop[index]).map(field => field.text).join('') + raw.slice(end), 'latin1');
+}
+
+/** Deterministic xorshift32 in [0, 1). */
+function seeded(seed: number): () => number {
+    let state = seed;
+    return () => {
+        state ^= state << 13; state ^= state >>> 17; state ^= state << 5;
+        return (state >>> 0) / 0x1_0000_0000;
+    };
+}
+
+const describeOutcome = (outcome: Outcome) => (typeof outcome === 'string' ? outcome : JSON.stringify(text(outcome)));
+const same = (a: Outcome, b: Outcome) => (typeof a === 'string' || typeof b === 'string' ? a === b : a.equals(b));
+
 const PRESERVED = [
-    'Return-Path: <bounce@example.org>',
     'Received: from mx.example.org (mx.example.org [192.0.2.1])',
     '\tby mail.example.com with ESMTPS id abc',
-    '\tfor <me@example.com>; Mon, 1 Jan 2026 00:00:00 +0000',
     'Received-SPF: pass (example.org: 192.0.2.1 is authorized)',
     'Authentication-Results: mail.example.com; dkim=pass header.d=example.org;',
     ' spf=pass smtp.mailfrom=example.org',
     'DKIM-Signature: v=1; a=rsa-sha256; d=example.org; s=s1;',
     '\tb=AbCdEf==',
-    'ARC-Seal: i=1; a=rsa-sha256; cv=none',
-    'ARC-Message-Signature: i=1; a=rsa-sha256',
-    'ARC-Authentication-Results: i=1; mx.example.com',
-    'X-Spamming: not a spam header',
-    'X-Spam: no dash, not matched',
-    'WD-Mail-Classification-Other: keep',
-    'Subject: hello',
-];
-const REMOVED = [
-    'X-Spam-Flag: YES',
-    'x-spam-status: Yes, score=12',
+    'X-Spam-Status: Yes, score=12',
     '\ttests=FOO,BAR',
-    'X-SPAM-LEVEL: ********',
-    'X-Spamd-Bar: +++++',
+    'X-Spam-Flag: YES',
+    'X-Spam-Level: ********',
     'X-Spamd-Result: default: False [9.1 / 15.0];',
-    ' R_SPF_ALLOW(-0.2)[+ip4:192.0.2.1];',
-    '\tR_DKIM_ALLOW(-0.2)[example.org:s=s1]',
+    ' R_SPF_ALLOW(-0.2)[+ip4:192.0.2.1]',
+    'X-Spamd-Bar: +++++',
     'X-Rspamd-Queue-Id: ABC123',
     'X-Rspamd-Server: rspamd1',
     'X-Rspamd-Action: add header',
+    'X-Rspamd-Score-Extra: 1',
+    'X-Rspamd-Scor: 1',
+    'X-Rspamd: 1',
+    'WD-Mail-Classification-Other: kept',
+    'WD-Mail-Classificatio: kept',
+    'X-WD-Mail-Classification: kept',
+    'X-Original-Rcpt: me@example.com',
+    'BIMI-Location: v=BIMI1; l=https://example.org/logo.svg',
+    'BIMI-Indicator: PHN2Zz4=',
+    'Delivered-To: not leading, kept',
+    'Return-Path: <not-leading@example.org>',
+    'Subject: hello',
+];
+const REMOVED = [
+    'X-Rspamd-Bar: +++',
+    'x-rspamd-report: SPF_FAIL(1) R_DKIM_REJECT(1)',
+    '\tFOLDED_REPORT(1)',
+    'X-RSPAMD-SCORE: 15.2',
+    'X-Rspamd-Score \t: 9 (whitespace before the colon)',
     'WD-Mail-Classification: spam',
     'wd-mail-classification-source: user',
     'WD-MAIL-CLASSIFICATION-INFO: moved to junk',
     '  folded continuation of the info header',
+    ' and another',
 ];
 
 /** Interleaves removed and preserved fields, keeping each folded group together. */
@@ -63,125 +162,266 @@ function sampleMessage(eol: string | ((index: number) => string)): { raw: string
     }, []);
     const keep = groups(PRESERVED);
     const drop = groups(REMOVED);
-    const rawLines: string[] = [];
-    const expectedLines: string[] = [];
     let index = 0;
     const end = () => (typeof eol === 'string' ? eol : eol(index++));
-    const max = Math.max(keep.length, drop.length);
-    for (let i = 0; i < max; i++) {
-        for (const line of keep[i] ?? []) { const e = end(); rawLines.push(line + e); expectedLines.push(line + e); }
-        for (const line of drop[i] ?? []) { rawLines.push(line + end()); }
+    let raw = `Delivered-To: me@example.com${end()}Return-Path: <bounce@example.org>${end()}`;
+    let expected = '';
+    for (let i = 0; i < Math.max(keep.length, drop.length); i++) {
+        for (const line of keep[i] ?? []) { const e = end(); raw += line + e; expected += line + e; }
+        for (const line of drop[i] ?? []) { raw += line + end(); }
     }
     const separator = end();
-    const body = `Body line one${end()}X-Spam-Flag: YES${end()}X-Rspamd-Score: 99${end()}\tindented body line${end()}\xe9\xff binary-ish`;
-    return { raw: rawLines.join('') + separator + body, expected: expectedLines.join('') + separator + body };
+    const body = `Body line one${end()}X-Rspamd-Score: 99${end()}WD-Mail-Classification: spam${end()}Delivered-To: x${end()}\tindented body line${end()}\xe9\xff\x00\r binary-ish`;
+    return { raw: raw + separator + body, expected: expected + separator + body };
 }
 
-describe('header classification', () => {
-    test('stripped names: exact WD-Mail-Classification family and X-Rspamd-/X-Spamd-/X-Spam- prefixes', () => {
-        for (const name of ['wd-mail-classification', 'wd-mail-classification-source', 'wd-mail-classification-info', 'x-rspamd-score', 'x-spamd-bar', 'x-spam-flag']) {
-            expect(isStrippedHeaderName(name)).toBe(true);
+describe('post-scan header names (rule A)', () => {
+    test('exactly the six listed names, in one exported constant', () => {
+        expect([...POST_SCAN_HEADER_NAMES].sort()).toEqual([...POST_SCAN].sort());
+        expect([...LEADING_DELIVERY_HEADER_NAMES]).toEqual(LEADING);
+        for (const name of POST_SCAN) {
+            expect(isPostScanHeaderName(name)).toBe(true);
         }
-        for (const name of ['wd-mail-classification-other', 'x-spam', 'x-spamming', 'x-rspamd', 'received', 'authentication-results', 'dkim-signature', 'arc-seal']) {
-            expect(isStrippedHeaderName(name)).toBe(false);
+        for (const name of ['x-spam-status', 'x-spam-flag', 'x-spamd-result', 'x-spamd-bar', 'x-rspamd-queue-id', 'x-rspamd-server', 'x-rspamd-action', 'wd-mail-classification-other', 'x-rspamd-score-extra', 'x-rspamd', 'delivered-to', 'return-path', 'received']) {
+            expect(isPostScanHeaderName(name)).toBe(false);
         }
     });
-});
 
-describe('stripHeaders', () => {
-    test('CRLF message: removes classification fields with all folded lines, preserves everything else byte-for-byte', () => {
+    test('CRLF: removes listed fields with their folded lines, preserves look-alikes and everything else byte-for-byte', () => {
         const { raw, expected } = sampleMessage('\r\n');
         expect(strip(raw)).toBe(expected);
+        expect(reference(latin1(raw)).toString('latin1')).toBe(expected);
     });
 
-    test('bare LF message', () => {
-        const { raw, expected } = sampleMessage('\n');
-        expect(strip(raw)).toBe(expected);
+    test('bare LF and mixed line endings', () => {
+        for (const eol of ['\n', (index: number) => (index % 3 === 0 ? '\n' : '\r\n')]) {
+            const { raw, expected } = sampleMessage(eol);
+            expect(strip(raw)).toBe(expected);
+        }
     });
 
-    test('mixed line endings are preserved exactly', () => {
-        const { raw, expected } = sampleMessage(index => (index % 3 === 0 ? '\n' : '\r\n'));
-        expect(strip(raw)).toBe(expected);
+    test('every occurrence is removed, wherever it appears in the header section', () => {
+        expect(strip('Subject: a\r\nX-Rspamd-Score: 1\r\nTo: b\r\nX-Rspamd-Score: 2\r\n\tfold\r\nX-RSPAMD-SCORE: 3\r\n\r\nbody')).toBe('Subject: a\r\nTo: b\r\n\r\nbody');
     });
 
-    test('body lines that look like headers survive', () => {
-        const raw = 'Subject: a\r\n\r\nX-Spam-Flag: YES\r\nWD-Mail-Classification: spam\r\n';
-        expect(strip(raw)).toBe(raw);
+    test('a continuation after a kept field stays with it; after a removed one it goes', () => {
+        expect(strip('Subject: a\r\n b\r\nX-Rspamd-Bar: Y\r\n c\r\n\td\r\nTo: x\r\n e\r\n\r\n')).toBe('Subject: a\r\n b\r\nTo: x\r\n e\r\n\r\n');
     });
 
-    test('obsolete whitespace before the colon is still matched', () => {
-        expect(strip('X-Spam-Flag \t: YES\r\nSubject: a\r\n\r\nb')).toBe('Subject: a\r\n\r\nb');
-    });
-
-    test('very long stripped names (beyond the inspected bytes) are still removed', () => {
-        expect(strip(`X-Spam-${'a'.repeat(300)}: v\r\nSubject: a\r\n\r\n`)).toBe('Subject: a\r\n\r\n');
-        expect(strip(`X-Keep-${'a'.repeat(300)}: v\r\n\r\n`)).toBe(`X-Keep-${'a'.repeat(300)}: v\r\n\r\n`);
-    });
-
-    test('edge cases: empty input, no body, no blank line, no trailing newline, leading blank line, leading continuation', () => {
-        expect(strip('')).toBe('');
-        expect(strip('Subject: a\r\nX-Spam-Flag: YES\r\n\r\n')).toBe('Subject: a\r\n\r\n');
-        expect(strip('Subject: a\r\nX-Spam-Flag: YES\r\n')).toBe('Subject: a\r\n');
-        expect(strip('Subject: a\r\nX-Spam-Flag: YES')).toBe('Subject: a\r\n');
-        expect(strip('X-Spam-Flag: YES\r\n\tmore')).toBe('');
-        expect(strip('\r\nX-Spam-Flag: YES\r\n')).toBe('\r\nX-Spam-Flag: YES\r\n');
-        expect(strip(' orphan continuation\r\nSubject: a\r\n\r\n')).toBe(' orphan continuation\r\nSubject: a\r\n\r\n');
-        expect(strip('From someone mbox-line\r\nX-Spam-Flag: YES\r\n\r\nb')).toBe('From someone mbox-line\r\n\r\nb');
-    });
-
-    test('a continuation after a kept header stays with it; after a removed one it goes', () => {
-        expect(strip('Subject: a\r\n b\r\nX-Spam-Flag: Y\r\n c\r\n\td\r\nTo: x\r\n e\r\n\r\n')).toBe('Subject: a\r\n b\r\nTo: x\r\n e\r\n\r\n');
-    });
-
-    test('binary body bytes are untouched (never decoded)', () => {
-        const head = enc('X-Spam-Flag: YES\r\nSubject: a\r\n\r\n');
-        const body = new Uint8Array(512).map((_, index) => index % 256);
-        const out = stripHeaders(Buffer.concat([head, body]));
-        expect(Buffer.from(out)).toEqual(Buffer.concat([enc('Subject: a\r\n\r\n'), body]));
+    test('very long names never match and are preserved', () => {
+        const long = `X-Rspamd-Score-${'a'.repeat(300)}: v\r\n`;
+        expect(strip(`${long}\r\n`)).toBe(`${long}\r\n`);
     });
 });
 
-describe('chunk boundaries', () => {
-    const cases = [sampleMessage('\r\n'), sampleMessage('\n'), sampleMessage(index => (index % 2 ? '\n' : '\r\n'))];
+describe('leading delivery headers (rule B)', () => {
+    const CASES: [string, string, string][] = [
+        ['Delivered-To then Return-Path', 'Delivered-To: a@b\r\nReturn-Path: <a@b>\r\nSubject: s\r\n\r\nbody', 'Subject: s\r\n\r\nbody'],
+        ['Return-Path then Delivered-To', 'Return-Path: <a@b>\r\nDelivered-To: a@b\r\nSubject: s\r\n\r\nbody', 'Subject: s\r\n\r\nbody'],
+        ['case-insensitive, LF, whitespace before colon', 'DELIVERED-TO : a@b\nreturn-path:<a@b>\nSubject: s\n\nbody', 'Subject: s\n\nbody'],
+        ['folded', 'Delivered-To: a@b\r\n\tfolded\r\nReturn-Path:\r\n <a@b>\r\nSubject: s\r\n\r\n', 'Subject: s\r\n\r\n'],
+        ['only Delivered-To leading', 'Delivered-To: a@b\r\nSubject: s\r\nReturn-Path: <kept>\r\n\r\n', 'Subject: s\r\nReturn-Path: <kept>\r\n\r\n'],
+        ['only Return-Path leading', 'Return-Path: <a@b>\r\nSubject: s\r\nDelivered-To: kept\r\n\r\n', 'Subject: s\r\nDelivered-To: kept\r\n\r\n'],
+        ['absent: nothing removed', 'Received: x\r\nDelivered-To: kept\r\nReturn-Path: <kept>\r\n\r\n', 'Received: x\r\nDelivered-To: kept\r\nReturn-Path: <kept>\r\n\r\n'],
+        ['at most one of each: a second Delivered-To is kept', 'Delivered-To: a\r\nDelivered-To: b\r\nReturn-Path: <c>\r\n\r\n', 'Delivered-To: b\r\nReturn-Path: <c>\r\n\r\n'],
+        ['a third leading field is kept', 'Delivered-To: a\r\nReturn-Path: <b>\r\nDelivered-To: c\r\nReturn-Path: <d>\r\n\r\n', 'Delivered-To: c\r\nReturn-Path: <d>\r\n\r\n'],
+        ['combined with post-scan removal', 'Return-Path: <a>\r\nX-Rspamd-Score: 1\r\nDelivered-To: kept\r\n\r\n', 'Delivered-To: kept\r\n\r\n'],
+        ['a message of only the leading pair', 'Delivered-To: a\r\nReturn-Path: <b>\r\n', ''],
+        ['in the body they are body', 'Subject: s\r\n\r\nDelivered-To: a\r\nReturn-Path: <b>\r\n', 'Subject: s\r\n\r\nDelivered-To: a\r\nReturn-Path: <b>\r\n'],
+    ];
+    for (const [name, raw, expected] of CASES) {
+        test(name, () => {
+            expect(strip(raw)).toBe(expected);
+            expect(reference(latin1(raw)).toString('latin1')).toBe(expected);
+        });
+    }
+});
 
-    test('split into two chunks at every byte offset produces identical output', () => {
-        for (const { raw, expected } of cases) {
-            const input = enc(raw);
-            const whole = Buffer.from(stripHeaders(input));
-            expect(dec(whole)).toBe(expected);
-            for (let offset = 0; offset <= input.length; offset++) {
-                const stripper = new HeaderStripper();
-                const out = Buffer.concat([...stripper.push(input.subarray(0, offset)), ...stripper.push(input.subarray(offset)), ...stripper.end()]);
-                if (!out.equals(whole)) {
-                    throw new Error(`mismatch when split at offset ${offset}`);
+describe('malformed messages (rule C)', () => {
+    const CASES: [string, string, MalformedReason][] = [
+        ['bare CR inside a value', 'Subject: a\rb\r\n\r\nbody', 'bare_cr'],
+        ['bare-CR line endings', 'Subject: keep\rTo: x\r\rbody', 'bare_cr'],
+        ['CR CR LF', 'Subject: a\r\r\n\r\n', 'bare_cr'],
+        ['bare CR inside a removed field continuation', 'X-Rspamd-Score: 1\r\n\tfold\rbare\r\n\r\n', 'bare_cr'],
+        ['bare CR at the end of input', 'Subject: a\r', 'bare_cr'],
+        ['blank line made of a bare CR', 'Subject: a\r\n\rTo: b\r\n\r\n', 'bare_cr'],
+        ['NUL in a value', 'Subject: a\x00b\r\n\r\n', 'nul'],
+        ['NUL in a field name', 'Sub\x00ject: a\r\n\r\n', 'nul'],
+        ['line without a colon', 'Subject: a\r\nX-Spam-Flag\r\n\r\n', 'invalid_line'],
+        ['body without a separator', 'Subject: a\nThis is the body\n', 'invalid_line'],
+        ['space inside a field name', 'Bad Name: x\r\n\r\n', 'invalid_line'],
+        ['leading colon', ':x\r\n\r\n', 'invalid_line'],
+        ['8-bit field name', '\xe9t\xe9: x\r\n\r\n', 'invalid_line'],
+        ['control byte in a field name', 'Na\x01me: x\r\n\r\n', 'invalid_line'],
+        ['incomplete field name at the end of input', 'Subject: a\r\nSubject', 'invalid_line'],
+        ['mbox From line later on', 'Subject: a\r\nFrom sender later\r\n\r\n', 'invalid_line'],
+        ['continuation before any field', ' leading continuation\r\nSubject: a\r\n\r\n', 'leading_continuation'],
+        ['tab continuation first', '\tx\r\n\r\n', 'leading_continuation'],
+        ['mbox From envelope line first', 'From sender@example.org Mon Jan  1 00:00:00 2026\r\nSubject: s\r\n\r\nb', 'mbox_envelope'],
+        ['bare mbox From line', 'From ', 'mbox_envelope'],
+        ['empty message', '', 'empty'],
+    ];
+    for (const [name, raw, reason] of CASES) {
+        test(`${name} → ${reason}`, () => {
+            expect(malformedReason(raw)).toBe(reason);
+            expect(reference(latin1(raw))).toBe('malformed');
+        });
+    }
+
+    test('a malformed line at any position rejects the whole message (nothing is emitted)', () => {
+        const fields = ['Delivered-To: a\r\n', 'Received: from a\r\n', '\tby b\r\n', 'X-Rspamd-Score: 1\r\n', ' folded\r\n', 'Subject: s\r\n'];
+        for (const bad of ['not a header\r\n', 'X-Spam-Flag: bare\rCR\r\n', 'Bad Name: x\r\n', ':x\r\n', '\xe9: x\r\n', 'X: a\x00\r\n']) {
+            for (let position = 1; position <= fields.length; position++) {
+                const raw = fields.slice(0, position).join('') + bad + fields.slice(position).join('') + '\r\nbody\r\n';
+                const input = latin1(raw);
+                for (const size of [input.length, 1, 3, 7]) {
+                    const stripper = new HeaderStripper();
+                    const emitted: Uint8Array[] = [];
+                    expect(() => {
+                        for (let offset = 0; offset < input.length; offset += size) {
+                            emitted.push(...stripper.push(input.subarray(offset, offset + size)));
+                        }
+                        stripper.end();
+                    }).toThrow(MalformedMessage);
+                    expect(emitted).toHaveLength(0);
                 }
             }
+            // After the blank separator the same line is ordinary body.
+            expect(strip(`${fields.join('')}\r\n${bad}`)).toBe(`Received: from a\r\n\tby b\r\nSubject: s\r\n\r\n${bad}`);
         }
     });
+});
 
-    test('one byte at a time produces identical output', () => {
-        for (const { raw, expected } of cases) {
-            expect(dec(chunked(enc(raw), [1]))).toBe(expected);
-        }
+describe('valid edge cases', () => {
+    test('a message with headers but no blank line or body, with or without a final newline', () => {
+        expect(strip('Subject: a\r\nX-Rspamd-Bar: +\r\n')).toBe('Subject: a\r\n');
+        expect(strip('Subject: a\r\nX-Rspamd-Bar: +')).toBe('Subject: a\r\n');
+        expect(strip('X-Rspamd-Bar: +\r\n\tmore')).toBe('');
+        expect(strip('Subject: a')).toBe('Subject: a');
     });
 
-    test('seeded random chunkings produce identical output', () => {
-        let seed = 0x2545f491;
-        const random = () => {
-            seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
-            return (seed >>> 0) / 0x1_0000_0000;
-        };
-        for (const { raw, expected } of cases) {
-            const input = enc(raw);
-            for (let round = 0; round < 300; round++) {
-                const sizes = Array.from({ length: 16 }, () => 1 + Math.floor(random() * 40));
-                expect(dec(chunked(input, sizes))).toBe(expected);
+    test('8-bit bytes in values and very long lines are preserved', () => {
+        const raw = `Subject: caf\xe9 \xff\xfe\x80\r\nX-Long: ${'v'.repeat(200_000)}\r\nX-Rspamd-Score: 1\r\n\r\nbody`;
+        expect(strip(raw)).toBe(`Subject: caf\xe9 \xff\xfe\x80\r\nX-Long: ${'v'.repeat(200_000)}\r\n\r\nbody`);
+    });
+
+    test('a message that starts with the blank line has an empty header section and passes unchanged', () => {
+        expect(strip('\r\nX-Rspamd-Score: 1\r\n')).toBe('\r\nX-Rspamd-Score: 1\r\n');
+        expect(strip('\n')).toBe('\n');
+    });
+
+    test('a message with nothing to remove is returned unchanged', () => {
+        const raw = 'Received: x\r\nSubject: y\r\n\r\nbody';
+        expect(strip(raw)).toBe(raw);
+    });
+});
+
+describe('body byte identity', () => {
+    test('binary bodies (every byte value, NUL, bare CR) are untouched', () => {
+        const head = latin1('Delivered-To: a\r\nReturn-Path: <b>\r\nX-Rspamd-Score: 1\r\nSubject: a\r\n\r\n');
+        const body = new Uint8Array(4096).map((_, index) => (index * 7) % 256);
+        const out = stripHeaders(new Uint8Array(Buffer.concat([head, body])));
+        expect(Buffer.from(out).equals(Buffer.concat([latin1('Subject: a\r\n\r\n'), body]))).toBe(true);
+    });
+
+    test('a body line that looks like a removable header survives', () => {
+        const raw = 'Subject: a\r\n\r\nX-Rspamd-Score: 99\r\nWD-Mail-Classification: spam\r\n\tcontinued\r\n';
+        expect(strip(raw)).toBe(raw);
+    });
+});
+
+describe('chunk boundaries against the whole-buffer reference', () => {
+    const cases = [
+        sampleMessage('\r\n').raw,
+        sampleMessage('\n').raw,
+        sampleMessage(index => (index % 2 ? '\n' : '\r\n')).raw,
+        'Delivered-To: a\r\nReturn-Path: <b>\r\n',
+        'Subject: a\r\nX-Rspamd-Bar: +',
+        'Subject: a\r\n\r',
+        'Subject: a\n\r\n',
+        'Subject: a\r\n\r\n',
+        '\r\n\r\n',
+        'Subject: a\r\nnot a header\r\n\r\nbody',
+        'Subject: a\rb\r\n\r\nbody',
+        'Subject: a\r',
+        ' lead\r\n\r\n',
+        'From x\r\n\r\n',
+        'Subject: a\x00\r\n\r\n',
+    ];
+
+    test('split into two chunks at every byte offset matches the reference', () => {
+        for (const raw of cases) {
+            const input = latin1(raw);
+            const expected = reference(input);
+            for (let offset = 0; offset <= input.length; offset++) {
+                const stripper = new HeaderStripper();
+                let outcome: Outcome;
+                try {
+                    outcome = Buffer.concat([...stripper.push(input.subarray(0, offset)), ...stripper.push(input.subarray(offset)), ...stripper.end()]);
+                } catch (error) {
+                    outcome = error instanceof MalformedMessage ? 'malformed' : 'header_too_large';
+                }
+                if (!same(outcome, expected)) {
+                    throw new Error(`mismatch for ${JSON.stringify(raw)} split at ${offset}: ${describeOutcome(outcome)} vs ${describeOutcome(expected)}`);
+                }
             }
+            expect(same(run(input, [1]), expected)).toBe(true);
         }
     });
 
-    test('a caller reusing its chunk buffer cannot corrupt pending header bytes', () => {
-        const input = enc('Subject: hello world\r\nX-Spam-Flag: YES\r\n\r\nbody');
+    test('seeded randomized messages and chunkings match the reference (valid, malformed and oversized)', () => {
+        const random = seeded(0x5eed_1234);
+        const pick = <T,>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
+        const names = ['Subject', 'X-Spam-Flag', 'X-Spam-Status', 'X-Spamd-Result', 'X-Rspamd-Queue-Id', 'X-Rspamd-Server', 'X-Rspamd-Score', 'x-rspamd-bar', 'X-RSPAMD-REPORT',
+            'WD-Mail-Classification', 'wd-mail-classification-source', 'WD-MAIL-CLASSIFICATION-INFO', 'WD-Mail-Classification-Other', 'Received', 'Delivered-To', 'Return-Path', 'From', 'To'];
+        const values = ['', ' v', ' value with spaces', '\tTAB value', ' caf\xe9 \xff', ' a:b:c', ` ${'x'.repeat(90)}`];
+        const malformed = ['no colon here', ':leading colon', 'Bad Name: x', 'Subject', 'From sender date', 'Na\x00me: x', 'X: a\x00b', '\xe9name: x', ' '];
+        const counts = { ok: 0, malformed: 0, header_too_large: 0 };
+        for (let round = 0; round < 4000; round++) {
+            const clean = random() < 0.5;
+            const eol = () => (clean ? pick(['\r\n', '\n']) : pick(['\r\n', '\r\n', '\n', '\n', '\r']));
+            const field = () => `${pick(names)}${pick(['', '', ' ', '\t '])}:${pick(values)}`;
+            let raw = '';
+            const leading = random();
+            if (leading < 0.25) { raw += `Delivered-To: a@b${eol()}Return-Path: <a@b>${eol()}`; }
+            else if (leading < 0.35) { raw += `Return-Path: <a@b>${eol()}Delivered-To: a@b${eol()}`; }
+            else if (leading < 0.4) { raw += `Delivered-To: a${eol()}\tfolded${eol()}Delivered-To: b${eol()}`; }
+            const count = Math.floor(random() * 10);
+            for (let index = 0; index < count; index++) {
+                const roll = random();
+                let line: string;
+                if (roll < 0.6 || (clean && roll >= 0.85)) { line = field(); }
+                else if (roll < 0.85) { line = `${pick([' ', '\t'])}${pick(['more', 'folded value', ''])}`; }
+                else if (roll < 0.93) { line = pick(malformed); }
+                else { const base = field(); const at = Math.floor(random() * (base.length + 1)); line = `${base.slice(0, at)}\r${base.slice(at)}`; }
+                raw += line + eol();
+            }
+            const ending = random();
+            if (ending < 0.6) {
+                raw += `${pick(['\r\n', '\n'])}body line${eol()}X-Rspamd-Score: 1${eol()}\tindented\xe9\x00\r${pick(['', '\r\n'])}`;
+            } else if (ending < 0.8 && raw.length > 0) {
+                raw = raw.slice(0, -1);
+            } else if (ending < 0.82) {
+                raw = '';
+            }
+            const input = latin1(raw);
+            const cap = pick([MAX_HEADER_SECTION_BYTES, MAX_HEADER_SECTION_BYTES, 40, 120, 300]);
+            const expected = reference(input, cap);
+            const sizes = Array.from({ length: 8 }, () => 1 + Math.floor(random() * (random() < 0.5 ? 4 : 64)));
+            const outcome = run(input, sizes, { maxHeaderBytes: cap });
+            if (!same(outcome, expected)) {
+                throw new Error(`round ${round} (cap ${cap}, sizes ${sizes.join(',')}): ${JSON.stringify(raw)} → ${describeOutcome(outcome)}, reference ${describeOutcome(expected)}`);
+            }
+            counts[typeof expected === 'string' ? expected : 'ok']++;
+        }
+        // The generator exercises every path substantially.
+        expect(counts.ok).toBeGreaterThan(1000);
+        expect(counts.malformed).toBeGreaterThan(1000);
+        expect(counts.header_too_large).toBeGreaterThan(200);
+    });
+
+    test('a caller reusing its chunk buffer cannot corrupt buffered header bytes', () => {
+        const input = latin1('Subject: hello world\r\nX-Rspamd-Score: 1\r\n\r\nbody');
         const stripper = new HeaderStripper();
         const buffer = new Uint8Array(5);
         const out: Uint8Array[] = [];
@@ -193,39 +433,63 @@ describe('chunk boundaries', () => {
             for (const chunk of stripper.push(buffer.subarray(0, piece.length))) { out.push(chunk.slice()); }
         }
         out.push(...stripper.end());
-        expect(dec(Buffer.concat(out))).toBe('Subject: hello world\r\n\r\nbody');
+        expect(text(Buffer.concat(out))).toBe('Subject: hello world\r\n\r\nbody');
     });
 });
 
 describe('limits', () => {
-    test('header section over the cap throws HeaderSectionTooLarge', () => {
-        const stripper = new HeaderStripper({ maxHeaderBytes: 64 });
-        expect(() => stripper.push(enc(`Subject: ${'a'.repeat(100)}\r\n`))).toThrow(HeaderSectionTooLarge);
+    test('a header section over the cap throws HeaderSectionTooLarge, with or without a separator', () => {
+        expect(() => new HeaderStripper({ maxHeaderBytes: 64 }).push(latin1(`Subject: ${'a'.repeat(100)}\r\n\r\n`))).toThrow(HeaderSectionTooLarge);
         const unterminated = new HeaderStripper({ maxHeaderBytes: 64 });
-        expect(() => { for (let i = 0; i < 100; i++) { unterminated.push(enc('a')); } }).toThrow(HeaderSectionTooLarge);
+        expect(() => { for (let i = 0; i < 100; i++) { unterminated.push(latin1('a')); } }).toThrow(HeaderSectionTooLarge);
+        // Refused as soon as the incomplete line passes the cap, without waiting for its end.
+        const incomplete = new HeaderStripper({ maxHeaderBytes: 64 });
+        incomplete.push(latin1(`S:${'a'.repeat(62)}`));
+        expect(() => incomplete.push(latin1('a'))).toThrow(HeaderSectionTooLarge);
+        // A malformed line within the cap is refused at once, even with more input to come.
+        const early = new HeaderStripper({ maxHeaderBytes: 64 });
+        expect(() => early.push(latin1('Subject: a\r\nnot a header\r\n'))).toThrow(MalformedMessage);
+    });
+
+    test('a header section of exactly the cap is accepted', () => {
+        const head = `S:${'a'.repeat(60)}\r\n`;
+        expect(head.length).toBe(64);
+        expect(text(stripHeaders(latin1(`${head}\r\nbody`), { maxHeaderBytes: 64 }))).toBe(`${head}\r\nbody`);
+        expect(text(stripHeaders(latin1(head), { maxHeaderBytes: 64 }))).toBe(head);
     });
 
     test('the cap applies to headers only; a large body passes', () => {
         const stripper = new HeaderStripper({ maxHeaderBytes: 64 });
-        stripper.push(enc('Subject: a\r\n\r\n'));
+        stripper.push(latin1('Subject: a\r\n\r\n'));
         expect(() => stripper.push(new Uint8Array(10_000))).not.toThrow();
     });
 
     test('message over the cap throws MessageTooLarge', () => {
         const stripper = new HeaderStripper({ maxMessageBytes: 100 });
-        stripper.push(enc('Subject: a\r\n\r\n'));
+        stripper.push(latin1('Subject: a\r\n\r\n'));
         expect(() => stripper.push(new Uint8Array(200))).toThrow(MessageTooLarge);
     });
 });
 
-describe('streaming', () => {
+describe('openStrippedBody', () => {
+    const sourceOf = (chunks: Uint8Array[], onCancel?: () => void) => {
+        let index = 0;
+        return new ReadableStream<Uint8Array>({
+            pull(controller) {
+                const chunk = chunks[index++];
+                if (chunk) { controller.enqueue(chunk); } else { controller.close(); }
+            },
+            cancel() { onCancel?.(); },
+        }, { highWaterMark: 0 });
+    };
+
     test('a large body is streamed with bounded buffering and arrives intact', async () => {
         const chunkSize = 64 * 1024;
         const chunks = 320; // 20 MiB
         let produced = 0;
         let consumed = 0;
         let maxOutstanding = 0;
-        const head = enc('X-Spam-Flag: YES\r\nX-Rspamd-Score: 1\r\n\tfolded\r\nSubject: big\r\n\r\n');
+        const head = latin1('Delivered-To: a\r\nX-Rspamd-Score: 1\r\n\tfolded\r\nSubject: big\r\n\r\n');
         let sent = 0;
         const source = new ReadableStream<Uint8Array>({
             pull(controller) {
@@ -241,44 +505,77 @@ describe('streaming', () => {
                 sent++;
             },
         }, { highWaterMark: 0 });
-        const stripped = createStrippedBody(source);
-        const reader = stripped.stream.getReader();
+        const opened = await openStrippedBody(source);
+        if (!opened.ok) { throw new Error('expected ok'); }
+        const reader = opened.body.stream.getReader();
+        const headerOut = 'Subject: big\r\n\r\n'.length;
         let outputBytes = 0;
         let checksum = 0;
         for (;;) {
             const { done, value } = await reader.read();
             if (done) { break; }
             outputBytes += value.length;
-            if (outputBytes > 'Subject: big\r\n\r\n'.length) { consumed = outputBytes - 'Subject: big\r\n\r\n'.length; }
+            consumed = Math.max(0, outputBytes - headerOut);
             checksum = (checksum + (value[value.length - 1] ?? 0)) % 1_000_003;
             maxOutstanding = Math.max(maxOutstanding, produced - consumed);
         }
-        expect(outputBytes).toBe('Subject: big\r\n\r\n'.length + chunkSize * chunks);
-        expect(stripped.stripper.removedFields).toBe(2);
+        expect(outputBytes).toBe(headerOut + chunkSize * chunks);
+        expect(opened.body.stripper.removedFields).toBe(2);
         // Never more than a couple of chunks are held between source and consumer.
         expect(maxOutstanding).toBeLessThanOrEqual(2 * chunkSize);
         expect(checksum).toBeGreaterThan(0);
     });
 
-    test('nothing is read from the source until the consumer pulls', async () => {
+    test('reads exactly the header section before returning; the body only when the consumer pulls', async () => {
         let pulls = 0;
-        const source = new ReadableStream<Uint8Array>({ pull(controller) { pulls++; controller.enqueue(enc('Subject: a\r\n\r\nbody')); controller.close(); } }, { highWaterMark: 0 });
-        const stripped = createStrippedBody(source);
+        const parts = [latin1('Subject: a\r\nX-Rspamd-'), latin1('Bar: +\r\n'), latin1('\r\nbody one'), latin1(' body two')];
+        const source = new ReadableStream<Uint8Array>({ pull(controller) { const part = parts[pulls++]; if (part) { controller.enqueue(part); } else { controller.close(); } } }, { highWaterMark: 0 });
+        const opened = await openStrippedBody(source);
+        if (!opened.ok) { throw new Error('expected ok'); }
+        expect(pulls).toBe(3);
         await Bun.sleep(5);
-        expect(pulls).toBe(0);
-        expect(dec(new Uint8Array(await new Response(stripped.stream).arrayBuffer()))).toBe('Subject: a\r\n\r\nbody');
-        expect(pulls).toBe(1);
+        expect(pulls).toBe(3);
+        expect(text(new Uint8Array(await new Response(opened.body.stream).arrayBuffer()))).toBe('Subject: a\r\n\r\nbody one body two');
     });
 
-    test('failure() distinguishes our own limits from source errors', async () => {
-        const tooLarge = createStrippedBody(new ReadableStream({ start(c) { c.enqueue(new Uint8Array(200)); c.close(); } }), { maxMessageBytes: 100 });
-        await expect(new Response(tooLarge.stream).arrayBuffer()).rejects.toThrow();
-        expect(tooLarge.failure()).toBe('message_too_large');
-        const broken = createStrippedBody(new ReadableStream({ pull(c) { c.error(new Error('reset')); } }));
-        await expect(new Response(broken.stream).arrayBuffer()).rejects.toThrow();
-        expect(broken.failure()).toBe('source_error');
-        const header = createStrippedBody(new ReadableStream({ start(c) { c.enqueue(new Uint8Array(200).fill(0x61)); c.close(); } }), { maxHeaderBytes: 100 });
-        await expect(new Response(header.stream).arrayBuffer()).rejects.toThrow();
-        expect(header.failure()).toBe('header_too_large');
+    test('a malformed or oversized header section is refused and the source cancelled', async () => {
+        for (const [chunks, failure, malformed] of [
+            [[latin1('Subject: a\r\nbad line\r\n\r\n'), new Uint8Array(1024)], 'malformed_message', 'invalid_line'],
+            [[latin1('Subject: a\r'), latin1('x\r\n\r\n')], 'malformed_message', 'bare_cr'],
+            [[], 'malformed_message', 'empty'],
+            [[latin1(`S: ${'a'.repeat(200)}`)], 'header_too_large', undefined],
+        ] as const) {
+            let cancelled = false;
+            const opened = await openStrippedBody(sourceOf([...chunks], () => { cancelled = true; }), { maxHeaderBytes: 100 });
+            expect(opened).toEqual({ ok: false, failure, ...(malformed ? { malformed } : {}) });
+            expect(cancelled || chunks.length === 0).toBe(true);
+        }
+    });
+
+    test('source errors: in the header section the open fails; in the body failure() says source_error', async () => {
+        const headFails = await openStrippedBody(new ReadableStream({ pull(controller) { controller.error(new Error('reset')); } }));
+        expect(headFails).toEqual({ ok: false, failure: 'source_error' });
+        const nonBytes = await openStrippedBody(new ReadableStream({ start(controller) { controller.enqueue('text' as unknown as Uint8Array); } }));
+        expect(nonBytes).toEqual({ ok: false, failure: 'source_error' });
+        let sent = false;
+        const bodyFails = await openStrippedBody(new ReadableStream({ pull(controller) { if (sent) { controller.error(new Error('reset')); } else { sent = true; controller.enqueue(latin1('Subject: a\r\n\r\nx')); } } }));
+        if (!bodyFails.ok) { throw new Error('expected ok'); }
+        await expect(new Response(bodyFails.body.stream).arrayBuffer()).rejects.toThrow();
+        expect(bodyFails.body.failure()).toBe('source_error');
+        const tooLarge = await openStrippedBody(sourceOf([latin1('Subject: a\r\n\r\n'), new Uint8Array(200)]), { maxMessageBytes: 100 });
+        if (!tooLarge.ok) { throw new Error('expected ok'); }
+        await expect(new Response(tooLarge.body.stream).arrayBuffer()).rejects.toThrow();
+        expect(tooLarge.body.failure()).toBe('message_too_large');
+    });
+
+    test('an aborted signal stops a hanging header read', async () => {
+        const controller = new AbortController();
+        const hanging = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(latin1('Subject: a\r\n')); } });
+        setTimeout(() => controller.abort(), 20);
+        const started = Date.now();
+        expect(await openStrippedBody(hanging, { signal: controller.signal })).toEqual({ ok: false, failure: 'source_error' });
+        expect(Date.now() - started).toBeLessThan(1_000);
+        const already = await openStrippedBody(sourceOf([latin1('Subject: a\r\n\r\n')]), { signal: AbortSignal.abort() });
+        expect(already).toEqual({ ok: false, failure: 'source_error' });
     });
 });

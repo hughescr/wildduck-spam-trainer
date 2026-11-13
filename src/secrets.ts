@@ -24,21 +24,32 @@ export function matchesAnyDigest(presented: string, digests: readonly Buffer[]):
     return matched;
 }
 
-async function withTimeout<T>(timeoutMs: number, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
+/** Runs one SDK call, aborted at `timeoutMs` or when `deadline` (the request deadline) aborts, whichever is first. */
+async function withTimeout<T>(timeoutMs: number, run: (signal: AbortSignal) => Promise<T>, deadline?: AbortSignal): Promise<T> {
+    if (deadline?.aborted) {
+        throw new Error('deadline');
+    }
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let onDeadline: (() => void) | undefined;
     try {
         return await Promise.race([
             run(controller.signal),
             new Promise<never>((_resolve, reject) => {
-                timer = setTimeout(() => {
+                const fail = (reason: string) => {
                     controller.abort();
-                    reject(new Error('timeout'));
-                }, timeoutMs);
+                    reject(new Error(reason));
+                };
+                timer = setTimeout(() => fail('timeout'), timeoutMs);
+                onDeadline = () => fail('deadline');
+                deadline?.addEventListener('abort', onDeadline, { once: true });
             }),
         ]);
     } finally {
         clearTimeout(timer);
+        if (onDeadline) {
+            deadline?.removeEventListener('abort', onDeadline);
+        }
     }
 }
 
@@ -65,7 +76,8 @@ export interface TrainingKeyStoreOptions {
 }
 
 export interface TrainingKeySource {
-    get(): Promise<string | undefined>;
+    /** `deadline` (the request deadline) bounds any load this call starts or joins. */
+    get(deadline?: AbortSignal): Promise<string | undefined>;
     /** The proxy rejected the key: reload it on the next request (still rate-limited). */
     invalidate(): void;
 }
@@ -91,15 +103,16 @@ export class TrainingKeyStore implements TrainingKeySource {
         this.timeoutMs = options.timeoutMs ?? 3_000;
     }
 
-    async get(): Promise<string | undefined> {
+    async get(deadline?: AbortSignal): Promise<string | undefined> {
         if (!this.options.parameterName) {
             this.options.log.error('training_key_unavailable', { upstream: 'ssm', reason: 'unconfigured' });
             return undefined;
         }
         const needsRefresh = !this.key || this.forceRefresh || this.now() - this.loadedAt >= this.ttlMs;
         // Join an in-flight load; otherwise start one at most once per retry interval.
+        // A Lambda instance serves one request at a time, so the starter's deadline bounds the load.
         if (needsRefresh && (this.pending || this.now() - this.lastAttempt >= this.failureRetryMs)) {
-            this.pending ??= this.load(this.options.parameterName).finally(() => {
+            this.pending ??= this.load(this.options.parameterName, deadline).finally(() => {
                 this.pending = undefined;
             });
             await this.pending;
@@ -115,12 +128,12 @@ export class TrainingKeyStore implements TrainingKeySource {
         this.forceRefresh = true;
     }
 
-    private async load(name: string): Promise<void> {
+    private async load(name: string, deadline: AbortSignal | undefined): Promise<void> {
         const started = this.now();
         this.lastAttempt = started;
         let output: unknown;
         try {
-            output = await withTimeout(this.timeoutMs, signal => this.options.client().send(new GetParameterCommand({ Name: name, WithDecryption: true }), { abortSignal: signal }));
+            output = await withTimeout(this.timeoutMs, signal => this.options.client().send(new GetParameterCommand({ Name: name, WithDecryption: true }), { abortSignal: signal }), deadline);
         } catch (error) {
             const missing = errorName(error) === 'ParameterNotFound';
             if (missing) {
@@ -162,7 +175,8 @@ export interface OriginVerifierOptions {
 }
 
 export interface OriginCheckSource {
-    verify(presented: string | undefined): Promise<OriginCheck>;
+    /** `deadline` (the request deadline) bounds any secret load this call starts or joins. */
+    verify(presented: string | undefined, deadline?: AbortSignal): Promise<OriginCheck>;
 }
 
 /**
@@ -191,7 +205,7 @@ export class OriginVerifier implements OriginCheckSource {
         this.timeoutMs = options.timeoutMs ?? 3_000;
     }
 
-    async verify(presented: string | undefined): Promise<OriginCheck> {
+    async verify(presented: string | undefined, deadline?: AbortSignal): Promise<OriginCheck> {
         if (presented === undefined || !ORIGIN_SECRET.test(presented)) {
             return 'mismatch';
         }
@@ -201,7 +215,7 @@ export class OriginVerifier implements OriginCheckSource {
         }
         // Join an in-flight load; otherwise start one when stale, at most once per retry interval.
         if ((!this.digests || this.now() - this.loadedAt >= this.ttlMs) && (this.pending || this.now() - this.lastAttempt >= this.failureRetryMs)) {
-            await this.refresh(this.options.secretId);
+            await this.refresh(this.options.secretId, deadline);
         }
         // Fail closed: values past their TTL are never used, even when a reload just failed.
         if (this.digests && this.now() - this.loadedAt >= this.ttlMs) {
@@ -214,7 +228,7 @@ export class OriginVerifier implements OriginCheckSource {
             return 'ok';
         }
         if (this.pending || this.now() - this.lastAttempt >= this.mismatchRefreshMs) {
-            await this.refresh(this.options.secretId);
+            await this.refresh(this.options.secretId, deadline);
             if (this.digests && matchesAnyDigest(presented, this.digests)) {
                 return 'ok';
             }
@@ -222,16 +236,17 @@ export class OriginVerifier implements OriginCheckSource {
         return 'mismatch';
     }
 
-    private refresh(secretId: string): Promise<void> {
-        this.pending ??= this.load(secretId).finally(() => {
+    /** Joins an in-flight load or starts one; a Lambda instance serves one request at a time, so the starter's deadline bounds it. */
+    private refresh(secretId: string, deadline: AbortSignal | undefined): Promise<void> {
+        this.pending ??= this.load(secretId, deadline).finally(() => {
             this.pending = undefined;
         });
         return this.pending;
     }
 
-    private async fetchStage(secretId: string, stage: 'AWSCURRENT' | 'AWSPREVIOUS'): Promise<string | undefined> {
+    private async fetchStage(secretId: string, stage: 'AWSCURRENT' | 'AWSPREVIOUS', deadline: AbortSignal | undefined): Promise<string | undefined> {
         try {
-            const output = await withTimeout(this.timeoutMs, signal => this.options.client().send(new GetSecretValueCommand({ SecretId: secretId, VersionStage: stage }), { abortSignal: signal }));
+            const output = await withTimeout(this.timeoutMs, signal => this.options.client().send(new GetSecretValueCommand({ SecretId: secretId, VersionStage: stage }), { abortSignal: signal }), deadline);
             const value = (output as { SecretString?: unknown } | undefined)?.SecretString;
             return typeof value === 'string' && ORIGIN_SECRET.test(value) ? value : undefined;
         } catch (error) {
@@ -243,11 +258,11 @@ export class OriginVerifier implements OriginCheckSource {
         }
     }
 
-    private async load(secretId: string): Promise<void> {
+    private async load(secretId: string, deadline: AbortSignal | undefined): Promise<void> {
         const started = this.now();
         this.lastAttempt = started;
         try {
-            const [current, previous] = await Promise.all([this.fetchStage(secretId, 'AWSCURRENT'), this.fetchStage(secretId, 'AWSPREVIOUS')]);
+            const [current, previous] = await Promise.all([this.fetchStage(secretId, 'AWSCURRENT', deadline), this.fetchStage(secretId, 'AWSPREVIOUS', deadline)]);
             if (!current) {
                 throw new Error('missing current origin secret');
             }

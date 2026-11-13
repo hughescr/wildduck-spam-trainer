@@ -102,9 +102,9 @@ export function createApp(deps: AppDependencies) {
     const now = deps.now ?? Date.now;
     const trainer = new Trainer({ apiBaseUrl: deps.apiBaseUrl, learnBaseUrl: deps.learnBaseUrl, fetch: deps.fetch, trainingKey: deps.trainingKey, log: deps.log, now });
 
-    async function route(event: FunctionUrlEvent, context: LambdaContextLike | undefined, requestId: string, setFields: (extra: RequestFields) => void): Promise<HttpResult> {
+    async function route(event: FunctionUrlEvent, deadline: Deadline, requestId: string, setFields: (extra: RequestFields) => void): Promise<HttpResult> {
         // 1. Origin verification, for every route (including health and unknown paths).
-        const origin = await deps.origin.verify(header(event, ORIGIN_VERIFY_HEADER));
+        const origin = await deps.origin.verify(header(event, ORIGIN_VERIFY_HEADER), deadline.signal);
         if (origin === 'unavailable') {
             setFields({ outcome: 'origin_unavailable' });
             return json(503, { error: 'unavailable' });
@@ -132,7 +132,7 @@ export function createApp(deps: AppDependencies) {
             return json(200, { service: SERVICE_NAME, version: SERVICE_VERSION, status: 'ok' });
         }
         if (routeName === '/readyz') {
-            const ready = (await deps.trainingKey.get()) !== undefined;
+            const ready = (await deps.trainingKey.get(deadline.signal)) !== undefined;
             setFields({ outcome: ready ? 'ready' : 'not_ready' });
             return json(ready ? 200 : 503, { ready });
         }
@@ -161,7 +161,6 @@ export function createApp(deps: AppDependencies) {
         const { request } = payload;
         const requestFields: LogFields = { ev: request.ev, user: request.user, mailbox: request.mailbox, uid: request.uid, ...(request.deliveryId ? { deliveryId: request.deliveryId } : {}) };
         setFields(requestFields);
-        const deadline = Deadline.fromContext(context?.getRemainingTimeInMillis ? () => context.getRemainingTimeInMillis?.() ?? 0 : undefined, now);
         const decision = await trainer.train(request, deadline, withFields(deps.log, { requestId, ...requestFields }));
         setFields({ outcome: decision.outcome, ...(decision.reason ? { reason: decision.reason } : {}), level: decision.level });
         return json(decision.status, { action: decision.action, ...(decision.action !== 'trained' && decision.reason ? { reason: decision.reason } : {}) });
@@ -169,13 +168,16 @@ export function createApp(deps: AppDependencies) {
 
     return async function handle(event: FunctionUrlEvent, context?: LambdaContextLike): Promise<HttpResult> {
         const started = now();
+        // One deadline for the whole invocation, created before origin verification, so
+        // secret loading counts against it and every await before the response is bounded by it.
+        const deadline = Deadline.fromContext(context?.getRemainingTimeInMillis ? () => context.getRemainingTimeInMillis?.() ?? 0 : undefined, now);
         const candidate = context?.awsRequestId ?? event.requestContext?.requestId;
         const requestId = candidate && REQUEST_ID.test(candidate) ? candidate : randomUUID();
         const rawMethod = event.requestContext?.http?.method?.toUpperCase() ?? 'GET';
         const fields: RequestFields = { requestId, route: 'other', method: KNOWN_METHODS.has(rawMethod) ? rawMethod : 'other' };
         let result: HttpResult;
         try {
-            result = await route(event, context, requestId, extra => Object.assign(fields, extra));
+            result = await route(event, deadline, requestId, extra => Object.assign(fields, extra));
         } catch {
             // Never serialize the error: it could carry upstream or message data.
             fields.outcome = 'internal_error';
