@@ -1,0 +1,416 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Edge (CloudFront, viewer IP restriction, origin secret), artifact bucket and IAM roles for wildduck-spam-trainer production
+
+Parameters:
+  FunctionUrlOrigin:
+    Type: String
+    Default: ''
+    Description: Service Function URL HTTPS origin without a trailing slash. Leave empty for phase 1 (no distribution, DNS or edge function).
+    AllowedPattern: '^(https://[a-z0-9]+\.lambda-url\.[a-z0-9-]+\.on\.aws)?$'
+  PublicDomainName:
+    Type: String
+    Default: wildduck-spam-training.rungie.com
+    AllowedValues: [wildduck-spam-training.rungie.com]
+    Description: Approved stable public webhook hostname
+  HostedZoneId:
+    Type: String
+    Default: Z1VXUCOF8PCGCR
+    AllowedValues: [Z1VXUCOF8PCGCR]
+    Description: Existing rungie.com hosted zone
+  GitHubRepositoryId:
+    Type: String
+    Description: Immutable numeric ID of hughescr/wildduck-spam-trainer (gh api repos/hughescr/wildduck-spam-trainer --jq .id)
+    AllowedPattern: '^[1-9][0-9]{0,15}$'
+  AllowedSourceIps:
+    Type: String
+    Default: 54.71.178.94,2600:1f14:e8d:b300:9114:71e8:b97:39c
+    Description: Comma-separated exact IPv4/IPv6 viewer addresses allowed to reach every path except /healthz and /readyz (no spaces, no CIDR)
+    # Hex digits, dots and colons only: the value is substituted into the edge function source.
+    AllowedPattern: '^[0-9A-Fa-f.:]{2,45}(,[0-9A-Fa-f.:]{2,45}){0,49}$'
+    MaxLength: 2000
+  OriginSecretRotationSerial:
+    Type: String
+    Default: '1'
+    Description: Increment after putting a new origin secret value so CloudFront re-resolves the origin header
+    AllowedPattern: '^[0-9]{1,9}$'
+
+Conditions:
+  HasFunctionUrlOrigin:
+    Fn::Not: [{Fn::Equals: [{Ref: FunctionUrlOrigin}, '']}]
+
+Resources:
+  # Same shared certificate custom-resource contract as webservices.
+  SSLCertificate:
+    Type: Custom::DNSCertificate
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DomainName:
+        Ref: PublicDomainName
+      ValidationMethod: DNS
+      Region: us-east-1
+      DomainValidationOptions:
+        - DomainName:
+            Ref: PublicDomainName
+          HostedZoneId:
+            Ref: HostedZoneId
+      ServiceToken:
+        Fn::ImportValue: CertificateAccepterLambda-Arn
+  # CloudFront sends this as X-Origin-Verify; the Lambda rejects every request without it.
+  # The value is generated here and never appears in this template or any output.
+  OriginVerifySecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: wildduck-spam-trainer/prod/origin-verify-key
+      Description: CloudFront-to-Lambda origin verification header value for wildduck-spam-trainer
+      GenerateSecretString:
+        PasswordLength: 64
+        ExcludePunctuation: true
+        IncludeSpace: false
+        RequireEachIncludedType: true
+      Tags:
+        - Key: Project
+          Value: wildduck-spam-trainer
+  ViewerRequestFunction:
+    Type: AWS::CloudFront::Function
+    Condition: HasFunctionUrlOrigin
+    Properties:
+      Name: wildduck-spam-trainer-prod-viewer-request
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Source-IP allowlist for every path except exact /healthz and /readyz; drops viewer x-origin-verify
+        Runtime: cloudfront-js-2.0
+      # AllowedSourceIps is restricted to hex digits, dots, colons and commas, so it
+      # cannot break out of the string literal. Never use JS template literals here.
+      FunctionCode:
+        Fn::Sub: |
+          var ALLOWED_SOURCE_IPS = '${AllowedSourceIps}';
+
+          function normalizeV4(text) {
+            var parts = text.split('.');
+            if (parts.length !== 4) { return null; }
+            var out = [];
+            for (var i = 0; i < 4; i++) {
+              if (!/^[0-9]{1,3}$/.test(parts[i])) { return null; }
+              var octet = parseInt(parts[i], 10);
+              if (octet > 255) { return null; }
+              out.push(String(octet));
+            }
+            return out.join('.');
+          }
+
+          function groupsOf(part) {
+            return part === '' ? [] : part.split(':');
+          }
+
+          function normalizeV6(text) {
+            var value = text.toLowerCase();
+            var tail = [];
+            if (value.indexOf('.') !== -1) {
+              var lastColon = value.lastIndexOf(':');
+              var v4 = normalizeV4(value.slice(lastColon + 1));
+              if (v4 === null) { return null; }
+              var o = v4.split('.');
+              tail = [(parseInt(o[0], 10) * 256 + parseInt(o[1], 10)).toString(16), (parseInt(o[2], 10) * 256 + parseInt(o[3], 10)).toString(16)];
+              value = value.slice(0, lastColon + 1);
+              if (value.slice(-2) !== '::') { value = value.slice(0, -1); }
+            }
+            var halves = value.split('::');
+            if (halves.length > 2) { return null; }
+            var head = groupsOf(halves[0]);
+            var rest = halves.length === 2 ? groupsOf(halves[1]) : [];
+            var count = head.length + rest.length + tail.length;
+            var groups;
+            if (halves.length === 2) {
+              if (count > 7) { return null; }
+              var fill = [];
+              for (var z = 0; z < 8 - count; z++) { fill.push('0'); }
+              groups = head.concat(fill, rest, tail);
+            } else {
+              if (count !== 8) { return null; }
+              groups = head.concat(tail);
+            }
+            for (var g = 0; g < 8; g++) {
+              if (!/^[0-9a-f]{1,4}$/.test(groups[g])) { return null; }
+              groups[g] = parseInt(groups[g], 16).toString(16);
+            }
+            if (groups.slice(0, 5).join(':') === '0:0:0:0:0' && groups[5] === 'ffff') {
+              var high = parseInt(groups[6], 16);
+              var low = parseInt(groups[7], 16);
+              return [high >> 8, high & 255, low >> 8, low & 255].join('.');
+            }
+            return groups.join(':');
+          }
+
+          function normalizeIp(text) {
+            if (typeof text !== 'string' || text.length < 2 || text.length > 45) { return null; }
+            return text.indexOf(':') === -1 ? normalizeV4(text) : normalizeV6(text);
+          }
+
+          var ALLOWED = [];
+          var entries = ALLOWED_SOURCE_IPS.split(',');
+          for (var e = 0; e < entries.length; e++) {
+            var normalized = normalizeIp(entries[e]);
+            if (normalized !== null) { ALLOWED.push(normalized); }
+          }
+
+          function handler(event) {
+            var request = event.request;
+            // Belt and braces: CloudFront's origin custom header already overrides it.
+            if (request.headers) { delete request.headers['x-origin-verify']; }
+            // Exact matches only; every other path, however spelled, needs an allowed viewer.
+            if (request.uri === '/healthz' || request.uri === '/readyz') { return request; }
+            // event.viewer.ip is CloudFront's connection address; X-Forwarded-For is never read.
+            var viewer = normalizeIp(event.viewer ? event.viewer.ip : null);
+            if (viewer !== null && ALLOWED.indexOf(viewer) !== -1) { return request; }
+            return { statusCode: 403, statusDescription: 'Forbidden', headers: { 'cache-control': { value: 'no-store' } } };
+          }
+  OriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Condition: HasFunctionUrlOrigin
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: wildduck-spam-trainer-prod-origin
+        Comment: Forward only Content-Type and User-Agent; never Host or x-origin-verify
+        HeadersConfig:
+          HeaderBehavior: whitelist
+          Headers: [Content-Type, User-Agent]
+        CookiesConfig:
+          CookieBehavior: none
+        QueryStringsConfig:
+          QueryStringBehavior: all
+  PublicDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: HasFunctionUrlOrigin
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - Ref: PublicDomainName
+        # The serial forces a distribution update, which re-resolves the origin secret reference.
+        Comment:
+          Fn::Sub: wildduck-spam-trainer webhook edge (origin secret serial ${OriginSecretRotationSerial})
+        Enabled: true
+        IPV6Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn:
+            Ref: SSLCertificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: lambda-function-url
+            DomainName:
+              Fn::Select: [2, {Fn::Split: ['/', {Ref: FunctionUrlOrigin}]}]
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginReadTimeout: 30
+              OriginSSLProtocols: [TLSv1.2]
+            # Origin custom headers override any same-named viewer header.
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue:
+                  Fn::Sub: '{{resolve:secretsmanager:${OriginVerifySecret}:SecretString}}'
+        DefaultCacheBehavior:
+          TargetOriginId: lambda-function-url
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          # AWS managed CachingDisabled policy.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId:
+            Ref: OriginRequestPolicy
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN:
+                Fn::GetAtt: [ViewerRequestFunction, FunctionARN]
+        # Supported errors keep their actual status/body, with no edge error-cache lifetime.
+        CustomErrorResponses:
+          - {ErrorCode: 400, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 403, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 404, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 405, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 414, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 416, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 500, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 501, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 502, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 503, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 504, ErrorCachingMinTTL: 0}
+      Tags:
+        - Key: Project
+          Value: wildduck-spam-trainer
+  PublicDnsA:
+    Type: AWS::Route53::RecordSet
+    Condition: HasFunctionUrlOrigin
+    Properties:
+      HostedZoneId:
+        Ref: HostedZoneId
+      Name:
+        Ref: PublicDomainName
+      Type: A
+      AliasTarget:
+        DNSName:
+          Fn::GetAtt: [PublicDistribution, DomainName]
+        HostedZoneId: Z2FDTNDATAQYW2
+  PublicDnsAAAA:
+    Type: AWS::Route53::RecordSet
+    Condition: HasFunctionUrlOrigin
+    Properties:
+      HostedZoneId:
+        Ref: HostedZoneId
+      Name:
+        Ref: PublicDomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName:
+          Fn::GetAtt: [PublicDistribution, DomainName]
+        HostedZoneId: Z2FDTNDATAQYW2
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: OldArtifactVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: wildduck-spam-trainer-prod-execution
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/wildduck-spam-trainer-prod-webhook:*
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/wildduck-spam-trainer/prod/training-proxy-key
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  Ref: OriginVerifySecret
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: wildduck-spam-trainer-github-deploy
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated:
+                Fn::ImportValue: GitHubOIDCProvider-Arn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                # New repositories use immutable owner/repository IDs in the subject.
+                # Verify with: gh api repos/hughescr/wildduck-spam-trainer/actions/oidc/customization/sub
+                token.actions.githubusercontent.com:sub:
+                  Fn::Sub: repo:hughescr@46348/wildduck-spam-trainer@${GitHubRepositoryId}:ref:refs/heads/main
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [cloudformation:CreateStack, cloudformation:UpdateStack, cloudformation:CreateChangeSet, cloudformation:DeleteChangeSet, cloudformation:DescribeChangeSet, cloudformation:ExecuteChangeSet, cloudformation:DescribeStacks, cloudformation:DescribeStackEvents, cloudformation:DescribeStackResource, cloudformation:DescribeStackResources, cloudformation:GetTemplate, cloudformation:GetTemplateSummary, cloudformation:ListStackResources, cloudformation:ListChangeSets, cloudformation:CancelUpdateStack, cloudformation:ContinueUpdateRollback]
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/wildduck-spam-trainer-prod/*
+              - Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: '*'
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation, s3:GetBucketVersioning, s3:GetEncryptionConfiguration, s3:GetBucketPublicAccessBlock]
+                Resource:
+                  Fn::GetAtt: [ArtifactBucket, Arn]
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource:
+                  Fn::Sub: ${ArtifactBucket.Arn}/serverless/wildduck-spam-trainer/prod/*
+              - Effect: Allow
+                Action: ['lambda:*']
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:wildduck-spam-trainer-prod-webhook
+                  - Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:wildduck-spam-trainer-prod-webhook:*
+              - Effect: Allow
+                Action: [iam:GetRole, iam:PassRole]
+                Resource:
+                  Fn::GetAtt: [ExecutionRole, Arn]
+                Condition:
+                  StringEqualsIfExists:
+                    iam:PassedToService: lambda.amazonaws.com
+              # CloudFormation locates log groups using the account-level list API.
+              - Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: '*'
+              - Effect: Allow
+                Action: ['logs:*']
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/wildduck-spam-trainer-prod-webhook
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/wildduck-spam-trainer-prod-webhook:*
+
+Outputs:
+  DistributionId:
+    Condition: HasFunctionUrlOrigin
+    Value:
+      Ref: PublicDistribution
+  DistributionDomainName:
+    Condition: HasFunctionUrlOrigin
+    Value:
+      Fn::GetAtt: [PublicDistribution, DomainName]
+  PublicWebhookUrl:
+    Condition: HasFunctionUrlOrigin
+    Value:
+      Fn::Sub: https://${PublicDomainName}/hooks/wildduck
+  ViewerRequestFunctionArn:
+    Condition: HasFunctionUrlOrigin
+    Value:
+      Fn::GetAtt: [ViewerRequestFunction, FunctionARN]
+  CertificateArn:
+    Value:
+      Ref: SSLCertificate
+  OriginVerifySecretArn:
+    Value:
+      Ref: OriginVerifySecret
+  ArtifactBucketName:
+    Value:
+      Ref: ArtifactBucket
+  ExecutionRoleArn:
+    Value:
+      Fn::GetAtt: [ExecutionRole, Arn]
+  GitHubDeployRoleArn:
+    Value:
+      Fn::GetAtt: [GitHubDeployRole, Arn]

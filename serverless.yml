@@ -1,0 +1,41 @@
+service: wildduck-spam-trainer
+frameworkVersion: '4'
+configValidationMode: error
+
+provider:
+  name: aws
+  runtime: nodejs26.x
+  architecture: arm64
+  region: us-west-2
+  stage: prod
+  # 1024 MB is an intentional floor (CPU share for streaming); never lower it.
+  memorySize: 1024
+  timeout: 25
+  versionFunctions: true
+  logRetentionInDays: 14
+  deploymentBucket:
+    name: ${env:AWS_DEPLOYMENT_BUCKET_NAME, 'wildduck-spam-trainer-artifacts-unconfigured'}
+    blockPublicAccess: true
+  iam:
+    role: ${env:AWS_EXECUTION_ROLE_ARN, 'arn:aws:iam::000000000000:role/wildduck-spam-trainer-prod-execution'}
+  # Names only, never values. Unset names leave the service fail-closed (503).
+  environment:
+    TRAINING_PROXY_KEY_PARAMETER: ${env:TRAINING_PROXY_KEY_PARAMETER, ''}
+    ORIGIN_VERIFY_SECRET_ID: ${env:ORIGIN_VERIFY_SECRET_ID, ''}
+  stackTags:
+    Project: wildduck-spam-trainer
+
+# Build once in the unprivileged CI job; deploy that exact artifact.
+build:
+  esbuild: false
+package:
+  artifact: dist/function.zip
+
+functions:
+  webhook:
+    handler: handler.handler
+    description: wildduck-spam-trainer ${file(./package.json):version}
+    # Public Function URL (AuthType NONE) behind CloudFront; the origin header is the only inbound authentication.
+    url: true
+    # Bounds the cost of abusive direct traffic; WildDuck posts one delivery at a time.
+    reservedConcurrency: 5
