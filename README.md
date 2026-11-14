@@ -104,7 +104,13 @@ Every request carries `X-Mail-Training-Key: <trainingProxyKey>`.
 | `GET …/users/{user}/mailboxes/{mailbox}/messages/{uid}/message.eml` | RFC 5322 bytes |
 | `POST https://spam.rungie.com/_mail-training/v1/learn-spam` or `/learn-ham` | Rspamd controller answer |
 
-The learn requests send `Content-Type: message/rfc822`, `Learn-Type: bulk` (learn requests only, never the WildDuck requests) and a chunked streaming body. Nginx limits the body to 25 MiB. The Nginx proxy must pass the `Learn-Type` request header through to the Rspamd controller unchanged (Nginx forwards request headers by default; do not clear it with `proxy_set_header Learn-Type ""` or restrict the forwarded headers). If the header is dropped, Rspamd answers 204 for a message it already classifies in the requested class.
+The learn requests send `Content-Type: message/rfc822`, `Learn-Type: bulk` (learn requests only, never the WildDuck requests) and a chunked streaming body. Nginx limits the body to 25 MiB. The Nginx proxy must pass the `Learn-Type` request header through to the Rspamd controller unchanged. Do not clear it with `proxy_set_header Learn-Type ""`. The production training locations use `proxy_pass_request_headers off`, so Nginx forwards no client header unless it is set explicitly; both learn locations therefore need
+
+```nginx
+proxy_set_header Learn-Type $http_learn_type;
+```
+
+Without it Rspamd never sees the header and answers 204 (`not_learnable`) for messages it already rates in the requested class, and a class reversal leaves the earlier training in place. A quick check after any proxy change: repeat a mark on an already-learned message; the logged outcome must be `already_learned` (208), not `not_learnable` (204).
 
 ### Header normalization
 
