@@ -39,6 +39,13 @@ const FLAGGED = '\\flagged';
 /** Message metadata JSON can contain parsed text/HTML; bound what is buffered. */
 const MAX_JSON_BYTES = 32 * 1024 * 1024;
 const OBJECT_ID = /^[0-9a-f]{24}$/;
+/**
+ * Every webhook is an explicit user decision (including a reversal of earlier training), so the
+ * learn request carries `Learn-Type: bulk`: Rspamd's default Bayes learn condition then skips its
+ * "already confidently in this class" probability check instead of answering 204.
+ */
+const LEARN_TYPE_HEADER = 'Learn-Type';
+const LEARN_TYPE = 'bulk';
 
 const trained = (): Decision => ({ status: 200, action: 'trained', outcome: 'trained', level: 'info' });
 /** A completed hand-off the learn side did not act on (208, 204): answered 200 so WildDuck never retries. */
@@ -306,7 +313,7 @@ class TrainingRun {
             // request rather than a complete one.
             const response = await this.call('learn', `${this.options.learnBaseUrl}/${endpoint}`, {
                 method: 'POST',
-                headers: { 'Content-Type': 'message/rfc822' },
+                headers: { 'Content-Type': 'message/rfc822', [LEARN_TYPE_HEADER]: LEARN_TYPE },
                 body: stripped.stream,
                 duplex: 'half',
             }, AbortSignal.any([this.deadline.signal, stripped.signal]), () => this.streamFailure(stripped.failure()));
@@ -351,7 +358,7 @@ class TrainingRun {
             this.log.info('message_streamed', { upstream: 'eml', bytes: stripped.stripper.inputBytes, removedHeaders: stripped.stripper.removedFields });
         }
         if (success) {
-            // 208: already learned; 204: not learnable (token count, learn conditions). Both are
+            // 208: already learned; 204: not learnable (token count limits, passthrough result, other learn guards). Both are
             // answered 200 `skipped`, because a retry cannot change the result.
             return status === 208 ? handedOff('already_learned') : status === 204 ? handedOff('not_learnable') : trained();
         }

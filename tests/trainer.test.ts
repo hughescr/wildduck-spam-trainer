@@ -21,6 +21,10 @@ describe('marked.spam', () => {
         const learn = calls[2];
         expect(learn?.method).toBe('POST');
         expect(learn?.headers.get('content-type')).toBe('message/rfc822');
+        expect(learn?.headers.get('learn-type')).toBe('bulk');
+        expect(learn?.headers.get('x-mail-training-key')).toBe(KEY);
+        // The WildDuck lookups never carry the learn-only header.
+        expect(calls.slice(0, 2).map(call => call.headers.get('learn-type'))).toEqual([null, null]);
         expect(text(learn?.body)).toBe(STRIPPED_MESSAGE);
     });
 
@@ -40,6 +44,10 @@ describe('marked.ham', () => {
         const result = await app(hamHook());
         expect(parse(result)).toEqual({ action: 'trained' });
         expect(calls.map(call => call.url.split('/').slice(-1)[0])).toEqual([MAILBOX, String(UID), 'message.eml', 'learn-ham']);
+        expect(calls[3]?.headers.get('learn-type')).toBe('bulk');
+        expect(calls[3]?.headers.get('x-mail-training-key')).toBe(KEY);
+        // The WildDuck lookups (mailbox, message, eml) never carry the learn-only header.
+        expect(calls.slice(0, 3).map(call => call.headers.get('learn-type'))).toEqual([null, null, null]);
         expect(text(calls[3]?.body)).toBe(STRIPPED_MESSAGE);
     });
 

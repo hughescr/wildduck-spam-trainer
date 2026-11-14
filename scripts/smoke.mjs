@@ -42,7 +42,7 @@ let learnMode = 'after';
 let uploadSeen;
 const seen = [];
 const server = createServer((req, res) => {
-    seen.push({ url: req.url, key: req.headers['x-mail-training-key'], token: req.headers['x-access-token'] });
+    seen.push({ url: req.url, key: req.headers['x-mail-training-key'], token: req.headers['x-access-token'], learnType: req.headers['learn-type'] });
     const base = `/api/users/${USER}/mailboxes/${MAILBOX}`;
     if (req.url === base) {
         res.setHeader('content-type', 'application/json');
@@ -98,7 +98,9 @@ try {
     for (const entry of seen) {
         assert.equal(entry.key, KEY, 'Every proxy request carries the training key');
         assert.equal(entry.token, undefined, 'No proxy request carries X-Access-Token');
+        assert.equal(entry.learnType, entry.url.startsWith('/learn/') ? 'bulk' : undefined, 'Only the learn request carries Learn-Type: bulk');
     }
+    assert.equal(seen.filter(entry => entry.learnType === 'bulk').length, 1, 'Exactly the learn request carries Learn-Type: bulk');
     const settledUpload = async () => {
         let timer;
         try {
