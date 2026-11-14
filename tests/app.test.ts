@@ -31,6 +31,21 @@ describe('origin verification precedes everything', () => {
         expect(calls).toHaveLength(0);
     });
 
+    test('newly forwarded viewer headers neither authenticate nor redirect Lambda processing', async () => {
+        const { app, calls } = buildApp();
+        const viewerHeaders = {
+            host: 'viewer.invalid', 'x-forwarded-for': '54.71.178.94',
+            'x-forwarded-host': 'viewer.invalid', 'x-forwarded-proto': 'http',
+            'x-real-ip': '54.71.178.94', 'cloudfront-viewer-address': '54.71.178.94:443',
+            authorization: 'viewer-token', cookie: 'viewer-cookie',
+        };
+        expect((await app(hook('{"ev":"deployment.probe"}', { ...viewerHeaders, 'x-origin-verify': '' }))).statusCode).toBe(403);
+        const result = await app(hook('{"ev":"deployment.probe"}', viewerHeaders));
+        expect(result.statusCode).toBe(200);
+        expect(parse(result)).toEqual({ action: 'ignored' });
+        expect(calls).toHaveLength(0);
+    });
+
     test('origin secret unavailable fails closed with 503', async () => {
         const { app, calls } = buildApp({ origin: { verify: async () => 'unavailable' }, routes: spamRoutes() });
         for (const request of [event('/healthz'), hook()]) {
@@ -97,7 +112,7 @@ describe('routes', () => {
         const result = await app(event('/healthz'));
         expect(result.statusCode).toBe(200);
         expect(parse(result)).toEqual({ service: 'wildduck-spam-trainer', version: packageJson.version, status: 'ok' });
-        expect(SERVICE_VERSION).toBe('0.1.0');
+        expect(SERVICE_VERSION).toBe(packageJson.version);
         expectJsonNoStore(result);
     });
 

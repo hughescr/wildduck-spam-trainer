@@ -46,7 +46,6 @@ jobs:
           EXECUTION_ROLE: ${{ vars.AWS_EXECUTION_ROLE_ARN }}
           TRAINING_PROXY_KEY_PARAMETER: ${{ vars.TRAINING_PROXY_KEY_PARAMETER }}
           ORIGIN_VERIFY_SECRET_ID: ${{ vars.ORIGIN_VERIFY_SECRET_ID }}
-          PUBLIC_ENDPOINT_ENABLED: ${{ vars.PUBLIC_ENDPOINT_ENABLED || 'false' }}
           ACCESS_KEY: ${{ secrets.SERVERLESS_ACCESS_KEY }}
         run: |
           test -n "$ROLE"
@@ -55,13 +54,13 @@ jobs:
           test -n "$ACCESS_KEY"
           test "$TRAINING_PROXY_KEY_PARAMETER" = /wildduck-spam-trainer/prod/training-proxy-key
           test "$ORIGIN_VERIFY_SECRET_ID" = wildduck-spam-trainer/prod/origin-verify-key
-          test "$PUBLIC_ENDPOINT_ENABLED" = true || test "$PUBLIC_ENDPOINT_ENABLED" = false
 
   deploy:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
     needs: [verify, deployment-status]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # A first deploy creates the CloudFront distribution and verification waits up to 10 minutes for DNS.
+    timeout-minutes: 40
     concurrency:
       group: production-deployment
       cancel-in-progress: false
@@ -100,4 +99,3 @@ jobs:
           AWS_REGION: us-west-2
           TRAINING_PROXY_KEY_PARAMETER: ${{ vars.TRAINING_PROXY_KEY_PARAMETER }}
           ORIGIN_VERIFY_SECRET_ID: ${{ vars.ORIGIN_VERIFY_SECRET_ID }}
-          PUBLIC_ENDPOINT_ENABLED: ${{ vars.PUBLIC_ENDPOINT_ENABLED || 'false' }}

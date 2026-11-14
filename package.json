@@ -1,6 +1,6 @@
 {
   "name": "wildduck-spam-trainer",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "description": "AWS Lambda that trains the Rspamd Bayes classifier from WildDuck marked.spam / marked.ham webhooks",
   "type": "module",
   "private": true,

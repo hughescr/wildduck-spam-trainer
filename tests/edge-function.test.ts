@@ -1,17 +1,26 @@
 import { describe, expect, test } from 'bun:test';
 
 /**
- * Executes the actual CloudFront Function source from infra/bootstrap.yml, with the
- * AllowedSourceIps parameter substituted exactly as Fn::Sub would, so the tested code
- * cannot drift from the deployed code.
+ * Executes the actual CloudFront Function source from serverless.yml, with the
+ * admin-owned SSM String substituted as Serverless's raw SSM resolver would.
  */
 interface Template {
-    Parameters: { AllowedSourceIps: { Default: string; AllowedPattern: string; MaxLength: number } };
-    Resources: { ViewerRequestFunction: { Properties: { FunctionCode: { 'Fn::Sub': string }; FunctionConfig: { Runtime: string }; AutoPublish: boolean } } };
+    resources: { Resources: {
+        ViewerRequestFunction: { Properties: { FunctionCode: string; FunctionConfig: { Runtime: string }; AutoPublish: boolean } };
+        PublicDistribution: { Properties: { DistributionConfig: {
+            DefaultCacheBehavior: { OriginRequestPolicyId: string };
+            Origins: { OriginCustomHeaders: { HeaderName: string; HeaderValue: string }[] }[];
+        } } };
+    } };
 }
-const template = Bun.YAML.parse(await Bun.file('infra/bootstrap.yml').text()) as Template;
-const source = template.Resources.ViewerRequestFunction.Properties.FunctionCode['Fn::Sub'];
-const parameter = template.Parameters.AllowedSourceIps;
+interface Bootstrap {
+    Parameters: { AllowedSourceIps: { Default: string; AllowedPattern: string; MaxLength: number } };
+    Resources: { AllowedSourceIpsParameter: { Properties: { Name: string; Type: string; Value: unknown; AllowedPattern: string } } };
+}
+const template = Bun.YAML.parse(await Bun.file('serverless.yml').text()) as Template;
+const bootstrap = Bun.YAML.parse(await Bun.file('infra/bootstrap.yml').text()) as Bootstrap;
+const source = template.resources.Resources.ViewerRequestFunction.Properties.FunctionCode;
+const parameter = bootstrap.Parameters.AllowedSourceIps;
 const allowedPattern = new RegExp(parameter.AllowedPattern);
 
 /** CloudFormation accepts a value only if it fully matches AllowedPattern and fits MaxLength. */
@@ -21,9 +30,9 @@ function substitute(allowed: string): string {
     if (!parameterAccepted(allowed)) {
         throw new Error('CloudFormation would reject this parameter value');
     }
-    // Fn::Sub semantics: ${Name} is replaced; ${!Literal} would become ${Literal}.
-    const code = source.replace(/\$\{([^}!]+)\}/g, (_match, name: string) => {
-        if (name !== 'AllowedSourceIps') {
+    // Resolve only the exact raw SSM reference used by the deployment template.
+    const code = source.replace(/\$\{([^}]+)\}/g, (_match, name: string) => {
+        if (name !== 'env:ALLOWED_SOURCE_IPS, ssm(raw):/wildduck-spam-trainer/prod/allowed-source-ips') {
             throw new Error(`unexpected substitution ${name}`);
         }
         return allowed;
@@ -53,8 +62,8 @@ describe('CloudFront viewer-request function (from the template)', () => {
     const handler = load();
 
     test('runs on cloudfront-js-2.0, auto-publishes, fits the 10 KB limit and uses only plain JS', () => {
-        expect(template.Resources.ViewerRequestFunction.Properties.FunctionConfig.Runtime).toBe('cloudfront-js-2.0');
-        expect(template.Resources.ViewerRequestFunction.Properties.AutoPublish).toBe(true);
+        expect(template.resources.Resources.ViewerRequestFunction.Properties.FunctionConfig.Runtime).toBe('cloudfront-js-2.0');
+        expect(template.resources.Resources.ViewerRequestFunction.Properties.AutoPublish).toBe(true);
         const code = substitute('1.1.1.1,2.2.2.2,3.3.3.3');
         // The largest list CloudFormation accepts still keeps the function under 10 KB.
         const largest = Array.from({ length: 50 }, () => 'ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff').join(',');
@@ -124,6 +133,27 @@ describe('CloudFront viewer-request function (from the template)', () => {
         }
     });
 
+    test('AllViewerExceptHostHeader preserves query strings/cookies while origin custom headers override viewer values', () => {
+        const config = template.resources.Resources.PublicDistribution.Properties.DistributionConfig;
+        expect(config.DefaultCacheBehavior.OriginRequestPolicyId).toBe('b689b0a8-53d0-40ab-baf2-68738e2966ac');
+        const event = viewerEvent('54.71.178.94', '/hooks/wildduck', { 'x-origin-verify': { value: 'viewer-value' } });
+        event.request.querystring = { probe: { value: 'one', multiValue: [{ value: 'one' }, { value: 'two' }] } };
+        event.request.cookies = { probe: { value: 'cookie' } };
+        const querystring = structuredClone(event.request.querystring);
+        const cookies = structuredClone(event.request.cookies);
+        const result = handler(event);
+        expect(result).toBe(event.request);
+        expect(event.request.querystring).toEqual(querystring);
+        expect(event.request.cookies).toEqual(cookies);
+        expect(result.headers?.['x-origin-verify']).toBeUndefined();
+        const customHeaders = Object.fromEntries((config.Origins[0]?.OriginCustomHeaders ?? []).map(header => [header.HeaderName.toLowerCase(), { value: header.HeaderValue }]));
+        expect(customHeaders).toEqual({ 'x-origin-verify': { value: '{{resolve:secretsmanager:${env:ORIGIN_VERIFY_SECRET_ID}:SecretString}}' } });
+        const viewerHeaders = { ...result.headers, 'x-origin-verify': { value: 'viewer-value' } };
+        const originHeaders = { ...viewerHeaders, ...customHeaders };
+        expect(originHeaders['x-origin-verify']).toEqual({ value: '{{resolve:secretsmanager:${env:ORIGIN_VERIFY_SECRET_ID}:SecretString}}' });
+        expect(originHeaders['x-origin-verify']?.value).not.toBe('viewer-value');
+    });
+
     test('invalid allowlist entries are ignored rather than matching anything', () => {
         const odd = load('1.2.3,::1::2,abc,1.2.3.4');
         expect(forwarded(odd(viewerEvent('1.2.3.4')))).toBe(true);
@@ -133,6 +163,15 @@ describe('CloudFront viewer-request function (from the template)', () => {
 });
 
 describe('AllowedSourceIps parameter cannot inject code', () => {
+    test('SSM also enforces the bootstrap allowlist pattern for subsequent admin updates', () => {
+        expect(bootstrap.Resources.AllowedSourceIpsParameter.Properties).toMatchObject({
+            Name: '/wildduck-spam-trainer/prod/allowed-source-ips',
+            Type: 'String',
+            Value: { Ref: 'AllowedSourceIps' },
+            AllowedPattern: parameter.AllowedPattern,
+        });
+    });
+
     test('the default and ordinary lists are accepted', () => {
         expect(parameterAccepted(parameter.Default)).toBe(true);
         expect(parameter.Default).toBe('54.71.178.94,2600:1f14:e8d:b300:9114:71e8:b97:39c');

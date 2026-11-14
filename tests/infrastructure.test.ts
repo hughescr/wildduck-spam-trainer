@@ -1,13 +1,13 @@
 import { describe, expect, test } from 'bun:test';
 
 type Resource = { Type: string; Condition?: string; DeletionPolicy?: string; UpdateReplacePolicy?: string; Properties: Record<string, unknown> };
-interface PolicyStatement { Effect?: string; Action: string | string[]; Resource: unknown; Condition?: unknown }
+interface PolicyStatement { Sid?: string; Effect?: string; Action: string | string[]; Resource: unknown; Condition?: unknown }
 interface Serverless {
     service: string; frameworkVersion: string; configValidationMode: string;
-    provider: { runtime: string; architecture: string; region: string; stage: string; memorySize: number; timeout: number; logRetentionInDays: number; versionFunctions: boolean; iam: { role: string }; environment: Record<string, unknown> };
+    provider: { runtime: string; architecture: string; region: string; stage: string; deploymentMethod: string; memorySize: number; timeout: number; logRetentionInDays: number; versionFunctions: boolean; iam: { role: string }; environment: Record<string, unknown>; stackTags: Record<string, string>; tags: Record<string, string> };
     build: { esbuild: boolean }; package: { artifact: string };
     functions: Record<string, { handler: string; url: unknown; reservedConcurrency: number; description: string }>;
-    resources?: unknown;
+    resources: { extensions: Record<string, { Properties: Record<string, unknown> }>; Resources: Record<string, Resource>; Outputs: Record<string, { Value: unknown }> };
 }
 interface Bootstrap {
     Parameters: Record<string, { Type: string; Default?: string; AllowedPattern?: string; AllowedValues?: string[] }>;
@@ -29,7 +29,7 @@ const workflowText = await Bun.file('.github/workflows/ci.yml').text();
 const deployScript = await Bun.file('scripts/deploy.sh').text();
 const serverless = Bun.YAML.parse(serverlessText) as Serverless;
 const bootstrap = Bun.YAML.parse(bootstrapText) as Bootstrap;
-const resources = bootstrap.Resources;
+const resources = { ...bootstrap.Resources, ...serverless.resources.Resources };
 const distribution = resources['PublicDistribution']?.Properties['DistributionConfig'] as DistributionConfig;
 function resource(name: string): Resource {
     const found = resources[name];
@@ -60,11 +60,17 @@ describe('application stack (serverless.yml)', () => {
         expect(fn?.description).toBe('wildduck-spam-trainer ${file(./package.json):version}');
     });
 
-    test('deploys the prebuilt artifact only, with no extra resources and no cross-stack imports', () => {
+    test('deploys the prebuilt artifact and edge resources together using direct deployment', () => {
         expect(serverless.build.esbuild).toBe(false);
         expect(serverless.package.artifact).toBe('dist/function.zip');
-        expect(serverless.resources).toBeUndefined();
-        expect(serverlessText).not.toContain('ImportValue');
+        expect(serverless.provider.deploymentMethod).toBe('direct');
+        expect(serverless.provider.stage).toBe('prod');
+        expect(serverless.service).toBe('wildduck-spam-trainer');
+        expect(Object.keys(serverless.resources.Resources).sort()).toEqual(['PublicDistribution', 'PublicDnsA', 'PublicDnsAAAA', 'ViewerRequestFunction']);
+        const env = [...new Set([...serverlessText.matchAll(/\$\{env:([A-Z_]+)/g)].map(match => match[1]))].sort();
+        expect(env).toEqual(['ALLOWED_SOURCE_IPS', 'AWS_DEPLOYMENT_BUCKET_NAME', 'AWS_EXECUTION_ROLE_ARN', 'ORIGIN_SECRET_ROTATION_SERIAL', 'ORIGIN_VERIFY_SECRET_ID', 'TRAINING_PROXY_KEY_PARAMETER']);
+        expect(serverlessText).not.toContain('cfnRole');
+        expect(serverlessText).not.toContain('deploymentRole');
     });
 
     test('only resource names reach the Lambda environment, via exact-name-guarded variables', () => {
@@ -80,34 +86,56 @@ describe('application stack (serverless.yml)', () => {
     });
 });
 
-describe('bootstrap two-phase structure', () => {
-    test('FunctionUrlOrigin defaults to empty and gates the edge resources', () => {
-        const origin = bootstrap.Parameters['FunctionUrlOrigin'];
-        expect(origin?.Default).toBe('');
-        const pattern = new RegExp(origin?.AllowedPattern ?? '');
-        expect(pattern.test('')).toBe(true);
-        expect(pattern.test('https://abc123xyz.lambda-url.us-west-2.on.aws')).toBe(true);
-        for (const bad of ['https://abc.lambda-url.us-west-2.on.aws/', 'http://abc.lambda-url.us-west-2.on.aws', 'https://evil.example.com', 'https://abc.lambda-url.us-west-2.on.aws.evil.com']) {
-            expect(pattern.test(bad)).toBe(false);
+describe('one-time bootstrap structure', () => {
+    test('owns only the stable foundation and admin edge settings, without a Function URL input', () => {
+        expect(bootstrapText).not.toContain('FunctionUrlOrigin');
+        expect(serverlessText).not.toContain('FunctionUrlOrigin');
+        expect(bootstrap.Conditions).toBeUndefined();
+        expect(Object.keys(bootstrap.Parameters).sort()).toEqual(['AllowedSourceIps', 'GitHubRepositoryId', 'HostedZoneId', 'OriginSecretRotationSerial', 'PublicDomainName']);
+        expect(Object.keys(bootstrap.Resources).sort()).toEqual(['AllowedSourceIpsParameter', 'ArtifactBucket', 'ExecutionRole', 'GitHubDeployRole', 'OriginSecretRotationSerialParameter', 'OriginVerifySecret', 'SSLCertificate']);
+        for (const entry of Object.values(resources)) {
+            expect(entry.Condition).toBeUndefined();
         }
-        expect(bootstrap.Conditions).toEqual({ HasFunctionUrlOrigin: { 'Fn::Not': [{ 'Fn::Equals': [{ Ref: 'FunctionUrlOrigin' }, ''] }] } });
-        const conditional = Object.entries(resources).filter(([, resource]) => resource.Condition === 'HasFunctionUrlOrigin').map(([name]) => name).sort();
-        expect(conditional).toEqual(['OriginRequestPolicy', 'PublicDistribution', 'PublicDnsA', 'PublicDnsAAAA', 'ViewerRequestFunction']);
-        for (const name of ['SSLCertificate', 'OriginVerifySecret', 'ArtifactBucket', 'ExecutionRole', 'GitHubDeployRole']) {
-            expect(resources[name]?.Condition).toBeUndefined();
+        for (const [name, parameter, path] of [
+            ['AllowedSourceIpsParameter', 'AllowedSourceIps', 'allowed-source-ips'],
+            ['OriginSecretRotationSerialParameter', 'OriginSecretRotationSerial', 'origin-secret-rotation-serial'],
+        ] as const) {
+            expect(resource(name)).toMatchObject({ Type: 'AWS::SSM::Parameter', Properties: {
+                Name: `/wildduck-spam-trainer/prod/${path}`, Type: 'String', Value: { Ref: parameter }, AllowedPattern: bootstrap.Parameters[parameter]?.AllowedPattern,
+            } });
         }
     });
 
-    test('outputs of conditional resources are conditional, and nothing is exported for the app stack to import', () => {
-        for (const name of ['DistributionId', 'DistributionDomainName', 'PublicWebhookUrl', 'ViewerRequestFunctionArn']) {
-            expect(bootstrap.Outputs[name]?.Condition).toBe('HasFunctionUrlOrigin');
+    test('exports stable inputs only; mutable settings are read from SSM on every service deploy', () => {
+        for (const [name, ref] of [['CertificateArn', 'SSLCertificate'], ['HostedZoneId', 'HostedZoneId'], ['PublicDomainName', 'PublicDomainName']] as const) {
+            expect(bootstrap.Outputs[name]).toEqual({ Value: { Ref: ref }, Export: { Name: `wildduck-spam-trainer-prod-${name}` } });
+            expect(serverlessText).toContain(`Fn::ImportValue: wildduck-spam-trainer-prod-${name}`);
         }
-        for (const [name, output] of Object.entries(bootstrap.Outputs)) {
-            expect(output.Export).toBeUndefined();
-            const text = JSON.stringify(output.Value);
-            const conditionalRefs = ['PublicDistribution', 'ViewerRequestFunction', 'OriginRequestPolicy', 'PublicDnsA'];
-            if (conditionalRefs.some(ref => text.includes(ref))) {
-                expect(`${name}:${output.Condition}`).toBe(`${name}:HasFunctionUrlOrigin`);
+        expect(Object.keys(bootstrap.Outputs).sort()).toEqual(['ArtifactBucketName', 'CertificateArn', 'ExecutionRoleArn', 'GitHubDeployRoleArn', 'HostedZoneId', 'OriginVerifySecretArn', 'PublicDomainName']);
+        expect(serverlessText).toContain('${env:ALLOWED_SOURCE_IPS, ssm(raw):/wildduck-spam-trainer/prod/allowed-source-ips}');
+        expect(serverlessText).toContain('${env:ORIGIN_SECRET_ROTATION_SERIAL, ssm(raw):/wildduck-spam-trainer/prod/origin-secret-rotation-serial}');
+        expect(serverless.resources.Outputs).toEqual({
+            PublicWebhookUrl: { Value: { 'Fn::Join': ['', ['https://', { 'Fn::ImportValue': 'wildduck-spam-trainer-prod-PublicDomainName' }, '/hooks/wildduck']] } },
+            DistributionId: { Value: { Ref: 'PublicDistribution' } },
+            DistributionDomainName: { Value: { 'Fn::GetAtt': ['PublicDistribution', 'DomainName'] } },
+        });
+    });
+
+    test('every supported resource has the Email billing tag and service ownership tag', () => {
+        const tags = { Project: 'Email', Service: 'wildduck-spam-trainer' };
+        expect(serverless.provider.tags).toEqual(tags);
+        expect(serverless.provider.stackTags).toEqual(tags);
+        expect(serverless.resources.extensions).toEqual({
+            WebhookLogGroup: { Properties: { Tags: [{ Key: 'Project', Value: 'Email' }, { Key: 'Service', Value: 'wildduck-spam-trainer' }] } },
+        });
+        for (const [name, entry] of Object.entries(resources)) {
+            // Custom certificate contract has no verified Tags support; policies/records are untaggable.
+            if (['SSLCertificate', 'PublicDnsA', 'PublicDnsAAAA'].includes(name)) {
+                expect(entry.Properties['Tags']).toBeUndefined();
+            } else if (entry.Type === 'AWS::SSM::Parameter') {
+                expect(entry.Properties['Tags']).toEqual(tags);
+            } else {
+                expect(entry.Properties['Tags']).toEqual([{ Key: 'Project', Value: 'Email' }, { Key: 'Service', Value: 'wildduck-spam-trainer' }]);
             }
         }
     });
@@ -124,19 +152,24 @@ describe('bootstrap two-phase structure', () => {
         for (const [name, type] of [['PublicDnsA', 'A'], ['PublicDnsAAAA', 'AAAA']] as const) {
             const dns = resources[name];
             expect(dns?.Properties['Type']).toBe(type);
-            expect(dns?.Properties['Name']).toEqual({ Ref: 'PublicDomainName' });
+            expect(dns?.Properties['Name']).toEqual({ 'Fn::ImportValue': 'wildduck-spam-trainer-prod-PublicDomainName' });
+            expect(dns?.Properties['HostedZoneId']).toEqual({ 'Fn::ImportValue': 'wildduck-spam-trainer-prod-HostedZoneId' });
             expect(dns?.Properties['AliasTarget']).toEqual({ DNSName: { 'Fn::GetAtt': ['PublicDistribution', 'DomainName'] }, HostedZoneId: 'Z2FDTNDATAQYW2' });
         }
-        expect(distribution.Aliases).toEqual([{ Ref: 'PublicDomainName' }]);
-        expect(distribution.ViewerCertificate).toEqual({ AcmCertificateArn: { Ref: 'SSLCertificate' }, SslSupportMethod: 'sni-only', MinimumProtocolVersion: 'TLSv1.2_2021' });
+        expect(distribution.Aliases).toEqual([{ 'Fn::ImportValue': 'wildduck-spam-trainer-prod-PublicDomainName' }]);
+        expect(distribution.ViewerCertificate).toEqual({ AcmCertificateArn: { 'Fn::ImportValue': 'wildduck-spam-trainer-prod-CertificateArn' }, SslSupportMethod: 'sni-only', MinimumProtocolVersion: 'TLSv1.2_2021' });
     });
 });
 
 describe('CloudFront distribution', () => {
     test('one Function URL origin, https-only, 30 s read timeout, no OAC, WAF, API Gateway or Lambda@Edge', () => {
+        expect(resource('PublicDistribution').DeletionPolicy).toBe('RetainExceptOnCreate');
+        expect(resource('PublicDnsA').DeletionPolicy).toBeUndefined();
+        expect(resource('PublicDnsAAAA').DeletionPolicy).toBeUndefined();
+        expect(resource('PublicDistribution').UpdateReplacePolicy).toBe('Retain');
         expect(distribution.Origins).toHaveLength(1);
         const origin = distribution.Origins[0];
-        expect(origin?.DomainName).toEqual({ 'Fn::Select': [2, { 'Fn::Split': ['/', { Ref: 'FunctionUrlOrigin' }] }] });
+        expect(origin?.DomainName).toEqual({ 'Fn::Select': [2, { 'Fn::Split': ['/', { 'Fn::GetAtt': ['WebhookLambdaFunctionUrl', 'FunctionUrl'] }] }] });
         expect(origin?.CustomOriginConfig).toEqual({ OriginProtocolPolicy: 'https-only', OriginReadTimeout: 30, OriginSSLProtocols: ['TLSv1.2'] });
         expect(origin?.OriginAccessControlId).toBeUndefined();
         expect(distribution.WebACLId).toBeUndefined();
@@ -149,7 +182,7 @@ describe('CloudFront distribution', () => {
 
     test('the origin secret header is a Secrets Manager dynamic reference; the value never appears in the template', () => {
         expect(distribution.Origins[0]?.OriginCustomHeaders).toEqual([
-            { HeaderName: 'X-Origin-Verify', HeaderValue: { 'Fn::Sub': '{{resolve:secretsmanager:${OriginVerifySecret}:SecretString}}' } },
+            { HeaderName: 'X-Origin-Verify', HeaderValue: '{{resolve:secretsmanager:${env:ORIGIN_VERIFY_SECRET_ID}:SecretString}}' },
         ]);
         const secret = resources['OriginVerifySecret'];
         expect(secret?.Type).toBe('AWS::SecretsManager::Secret');
@@ -162,15 +195,15 @@ describe('CloudFront distribution', () => {
 
     test('a rotation serial is wired into the distribution so updates re-resolve the dynamic reference', () => {
         expect(bootstrap.Parameters['OriginSecretRotationSerial']?.Default).toBe('1');
-        expect(JSON.stringify(distribution.Comment)).toContain('${OriginSecretRotationSerial}');
+        expect(distribution.Comment).toBe('wildduck-spam-trainer webhook edge (origin secret serial ${env:ORIGIN_SECRET_ROTATION_SERIAL, ssm(raw):/wildduck-spam-trainer/prod/origin-secret-rotation-serial})');
     });
 
-    test('single default behavior: seven methods, CachingDisabled, custom origin policy, viewer-request function', () => {
+    test('single default behavior: seven methods, CachingDisabled, managed origin policy, viewer-request function', () => {
         const behavior = distribution.DefaultCacheBehavior;
         expect(distribution.CacheBehaviors).toBeUndefined();
         expect(behavior['AllowedMethods']).toEqual(['GET', 'HEAD', 'OPTIONS', 'PUT', 'PATCH', 'POST', 'DELETE']);
         expect(behavior['CachePolicyId']).toBe('4135ea2d-6df8-44a3-9df3-4b5a84be39ad');
-        expect(behavior['OriginRequestPolicyId']).toEqual({ Ref: 'OriginRequestPolicy' });
+        expect(behavior['OriginRequestPolicyId']).toBe('b689b0a8-53d0-40ab-baf2-68738e2966ac');
         expect(behavior['ViewerProtocolPolicy']).toBe('https-only');
         expect(behavior['FunctionAssociations']).toEqual([{ EventType: 'viewer-request', FunctionARN: { 'Fn::GetAtt': ['ViewerRequestFunction', 'FunctionARN'] } }]);
         expect(behavior['LambdaFunctionAssociations']).toBeUndefined();
@@ -186,14 +219,11 @@ describe('CloudFront distribution', () => {
         }
     });
 
-    test('origin request policy forwards only Content-Type and User-Agent, never Host or x-origin-verify', () => {
-        const config = resources['OriginRequestPolicy']?.Properties['OriginRequestPolicyConfig'] as { HeadersConfig: { HeaderBehavior: string; Headers: string[] }; CookiesConfig: unknown; QueryStringsConfig: unknown };
-        expect(config.HeadersConfig).toEqual({ HeaderBehavior: 'whitelist', Headers: ['Content-Type', 'User-Agent'] });
-        const lower = config.HeadersConfig.Headers.map(header => header.toLowerCase());
-        expect(lower).not.toContain('host');
-        expect(lower).not.toContain('x-origin-verify');
-        expect(config.CookiesConfig).toEqual({ CookieBehavior: 'none' });
-        expect(config.QueryStringsConfig).toEqual({ QueryStringBehavior: 'all' });
+    test('uses AllViewerExceptHostHeader with all query strings and cookies, without a custom policy or policy-management permissions', () => {
+        expect(distribution.DefaultCacheBehavior['OriginRequestPolicyId']).toBe('b689b0a8-53d0-40ab-baf2-68738e2966ac');
+        expect(resources['OriginRequestPolicy']).toBeUndefined();
+        expect(Object.values(resources).some(entry => entry.Type === 'AWS::CloudFront::OriginRequestPolicy')).toBe(false);
+        expect(statements('GitHubDeployRole').flatMap(actions).some(action => action.includes('OriginRequestPolicy'))).toBe(false);
     });
 });
 
@@ -210,11 +240,15 @@ describe('IAM', () => {
     test('CI deploy role is limited to its own stack, function, log group and artifact prefix', () => {
         const deploy = statements('GitHubDeployRole');
         const all = deploy.flatMap(actions);
-        for (const forbidden of ['cloudfront:', 'route53:', 'ssm:', 'secretsmanager:', 'acm:', 'kms:', 'wafv2:', 'apigateway:', 'iam:Create', 'iam:Put', 'iam:Attach', 'iam:Update', 'iam:Delete', 'sts:']) {
+        for (const forbidden of ['acm:', 'kms:', 'wafv2:', 'apigateway:', 'iam:Create', 'iam:Put', 'iam:Attach', 'iam:Update', 'iam:Delete', 'ssm:Put', 'ssm:Delete', 'secretsmanager:Put', 'secretsmanager:Update', 'sts:']) {
             expect(all.some(action => action.startsWith(forbidden))).toBe(false);
         }
-        const wildcard = deploy.filter(statement => statement.Resource === '*').flatMap(actions).sort();
-        expect(wildcard).toEqual(['cloudformation:ValidateTemplate', 'logs:DescribeLogGroups']);
+        const wildcard = deploy.filter(statement => statement.Effect === 'Allow' && statement.Resource === '*').flatMap(actions).sort();
+        expect(wildcard).toEqual(['cloudformation:ValidateTemplate', 'cloudfront:CreateDistribution', 'cloudfront:CreateFunction', 'cloudfront:ListDistributions', 'cloudfront:ListFunctions', 'logs:DescribeIndexPolicies', 'logs:DescribeLogGroups', 'logs:DescribeResourcePolicies', 'route53:ListHostedZones']);
+        const allowedActions = deploy.filter(statement => statement.Effect === 'Allow').flatMap(actions);
+        expect(allowedActions).not.toContain('cloudformation:CreateChangeSet');
+        expect(allowedActions).not.toContain('cloudformation:ExecuteChangeSet');
+        expect(allowedActions).not.toContain('cloudformation:DeleteStack');
         const lambda = deploy.find(statement => actions(statement).includes('lambda:*'));
         expect(lambda?.Resource).toEqual([
             { 'Fn::Sub': 'arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:wildduck-spam-trainer-prod-webhook' },
@@ -230,7 +264,128 @@ describe('IAM', () => {
         const objects = deploy.find(statement => actions(statement).includes('s3:PutObject'));
         expect(objects?.Resource).toEqual({ 'Fn::Sub': '${ArtifactBucket.Arn}/serverless/wildduck-spam-trainer/prod/*' });
         const iam = deploy.find(statement => actions(statement).some(action => action.startsWith('iam:')));
-        expect(iam).toEqual({ Effect: 'Allow', Action: ['iam:GetRole', 'iam:PassRole'], Resource: { 'Fn::GetAtt': ['ExecutionRole', 'Arn'] }, Condition: { StringEqualsIfExists: { 'iam:PassedToService': 'lambda.amazonaws.com' } } });
+        expect(iam).toEqual({ Sid: 'ExecutionRoleOnly', Effect: 'Allow', Action: ['iam:GetRole', 'iam:PassRole'], Resource: { 'Fn::GetAtt': ['ExecutionRole', 'Arn'] }, Condition: { StringEqualsIfExists: { 'iam:PassedToService': 'lambda.amazonaws.com' } } });
+    });
+
+    test('CI can only read the two admin edge settings and the exact origin secret', () => {
+        const deploy = statements('GitHubDeployRole');
+        expect(deploy.filter(statement => actions(statement).some(action => action.startsWith('ssm:')))).toEqual([{
+            Sid: 'ReadEdgeSettings', Effect: 'Allow', Action: ['ssm:GetParameter', 'ssm:GetParameters'], Resource: [
+                { 'Fn::Sub': 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/wildduck-spam-trainer/prod/allowed-source-ips' },
+                { 'Fn::Sub': 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/wildduck-spam-trainer/prod/origin-secret-rotation-serial' },
+            ],
+        }]);
+        expect(deploy.filter(statement => actions(statement).some(action => action.startsWith('secretsmanager:')))).toEqual([{
+            Sid: 'ResolveOriginSecret', Effect: 'Allow', Action: 'secretsmanager:GetSecretValue', Resource: { Ref: 'OriginVerifySecret' },
+        }]);
+    });
+
+    test('stack tags are restricted to Project/Service with a nonempty-key guard', () => {
+        const tags = statements('GitHubDeployRole').filter(statement => actions(statement).some(action => ['cloudformation:TagResource', 'cloudformation:UntagResource'].includes(action)));
+        expect(tags).toEqual([{
+            Sid: 'ServiceStackTags', Effect: 'Allow', Action: ['cloudformation:TagResource', 'cloudformation:UntagResource'],
+            Resource: { 'Fn::Sub': 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/wildduck-spam-trainer-prod/*' },
+            Condition: { 'ForAllValues:StringEquals': { 'aws:TagKeys': ['Project', 'Service'] }, Null: { 'aws:TagKeys': 'false' } },
+        }]);
+    });
+
+    test('alternate resource adoption and mutation paths are explicitly denied regardless of future Allows', () => {
+        expect(statements('GitHubDeployRole').filter(statement => statement.Effect === 'Deny')).toEqual([{
+            Sid: 'DenyAlternateResourceManagement', Effect: 'Deny',
+            Action: ['cloudformation:CreateChangeSet', 'cloudformation:ExecuteChangeSet', 'cloudformation:CreateResource', 'cloudformation:UpdateResource', 'cloudformation:DeleteResource', 'cloudformation:CreateStackRefactor', 'cloudformation:ExecuteStackRefactor', 'cloudformation:ImportStacksToStackSet'],
+            Resource: '*',
+        }]);
+    });
+
+    test('CloudFront IAM uses supported tag conditions and an exact viewer function ARN', () => {
+        const deploy = statements('GitHubDeployRole');
+        const edge = deploy.filter(statement => actions(statement).some(action => action.startsWith('cloudfront:')));
+        expect(edge.map(statement => statement.Sid)).toEqual(['ReadProviderListsViaCloudFormation', 'ReadDistributionDependenciesViaCloudFormation', 'CreateTaggedEdge', 'TagNewEdgeViaCloudFormation', 'ManageServiceDistribution', 'ManageViewerFunction']);
+        const bySid = (sid: string) => edge.find(statement => statement.Sid === sid);
+        expect(bySid('CreateTaggedEdge')).toEqual({
+            Sid: 'CreateTaggedEdge', Effect: 'Allow', Action: ['cloudfront:CreateDistribution', 'cloudfront:CreateFunction'], Resource: '*',
+            Condition: { StringEquals: { 'aws:RequestTag/Project': 'Email', 'aws:RequestTag/Service': 'wildduck-spam-trainer' } },
+        });
+        expect(bySid('TagNewEdgeViaCloudFormation')).toEqual({
+            Sid: 'TagNewEdgeViaCloudFormation', Effect: 'Allow', Action: 'cloudfront:TagResource',
+            Resource: [
+                { 'Fn::Sub': 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/*' },
+                { 'Fn::Sub': 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:function/wildduck-spam-trainer-prod-viewer-request' },
+            ],
+            Condition: { StringEquals: { 'aws:CalledViaLast': 'cloudformation.amazonaws.com', 'aws:RequestTag/Project': 'Email', 'aws:RequestTag/Service': 'wildduck-spam-trainer' } },
+        });
+        expect(bySid('ManageServiceDistribution')).toEqual({
+            Sid: 'ManageServiceDistribution', Effect: 'Allow',
+            Action: ['cloudfront:GetDistribution', 'cloudfront:GetDistributionConfig', 'cloudfront:UpdateDistribution', 'cloudfront:DeleteDistribution', 'cloudfront:ListTagsForResource', 'cloudfront:TagResource', 'cloudfront:UntagResource'],
+            Resource: { 'Fn::Sub': 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/*' },
+            Condition: { StringEquals: { 'aws:ResourceTag/Service': 'wildduck-spam-trainer' } },
+        });
+        expect(bySid('ManageViewerFunction')).toEqual({
+            Sid: 'ManageViewerFunction', Effect: 'Allow',
+            Action: ['cloudfront:DescribeFunction', 'cloudfront:GetFunction', 'cloudfront:TestFunction', 'cloudfront:UpdateFunction', 'cloudfront:PublishFunction', 'cloudfront:DeleteFunction', 'cloudfront:ListTagsForResource', 'cloudfront:TagResource', 'cloudfront:UntagResource'],
+            Resource: { 'Fn::Sub': 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:function/wildduck-spam-trainer-prod-viewer-request' },
+        });
+        expect(bySid('ReadProviderListsViaCloudFormation')).toEqual({
+            Sid: 'ReadProviderListsViaCloudFormation', Effect: 'Allow',
+            Action: ['cloudfront:ListDistributions', 'cloudfront:ListFunctions', 'logs:DescribeIndexPolicies', 'logs:DescribeResourcePolicies'], Resource: '*',
+            Condition: { StringEquals: { 'aws:CalledViaLast': 'cloudformation.amazonaws.com' } },
+        });
+        expect(bySid('ReadDistributionDependenciesViaCloudFormation')).toEqual({
+            Sid: 'ReadDistributionDependenciesViaCloudFormation', Effect: 'Allow', Action: ['cloudfront:GetConnectionGroup', 'cloudfront:GetVpcOrigin'],
+            Resource: [
+                { 'Fn::Sub': 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:connection-group/*' },
+                { 'Fn::Sub': 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:vpcorigin/*' },
+            ],
+            Condition: { StringEquals: { 'aws:CalledViaLast': 'cloudformation.amazonaws.com' } },
+        });
+        // CreateDistributionWithTags is an API, not an IAM action; no wildcard CloudFront actions.
+        expect(edge.flatMap(actions)).not.toContain('cloudfront:CreateDistributionWithTags');
+        expect(edge.flatMap(actions).some(action => action.includes('*'))).toBe(false);
+    });
+
+    test('Route53 writes only A/AAAA for the exact public name and zone; reads cannot mutate DNS', () => {
+        const dns = statements('GitHubDeployRole').filter(statement => actions(statement).some(action => action.startsWith('route53:')));
+        expect(dns).toEqual([
+            {
+                Sid: 'PublicDnsOnly', Effect: 'Allow', Action: 'route53:ChangeResourceRecordSets',
+                Resource: { 'Fn::Sub': 'arn:${AWS::Partition}:route53:::hostedzone/${HostedZoneId}' },
+                Condition: {
+                    'ForAllValues:StringEquals': {
+                        'route53:ChangeResourceRecordSetsNormalizedRecordNames': [{ Ref: 'PublicDomainName' }],
+                        'route53:ChangeResourceRecordSetsRecordTypes': ['A', 'AAAA'],
+                        'route53:ChangeResourceRecordSetsActions': ['CREATE', 'UPSERT', 'DELETE'],
+                    },
+                    Null: {
+                        'route53:ChangeResourceRecordSetsNormalizedRecordNames': 'false',
+                        'route53:ChangeResourceRecordSetsRecordTypes': 'false',
+                        'route53:ChangeResourceRecordSetsActions': 'false',
+                    },
+                },
+            },
+            { Sid: 'ListHostedZones', Effect: 'Allow', Action: 'route53:ListHostedZones', Resource: '*' },
+            { Sid: 'ReadPublicZone', Effect: 'Allow', Action: ['route53:GetHostedZone', 'route53:ListResourceRecordSets'], Resource: { 'Fn::Sub': 'arn:${AWS::Partition}:route53:::hostedzone/${HostedZoneId}' } },
+            { Sid: 'PollDnsChanges', Effect: 'Allow', Action: 'route53:GetChange', Resource: { 'Fn::Sub': 'arn:${AWS::Partition}:route53:::change/*' } },
+        ]);
+    });
+
+    test('covers the public provider schema read/list actions for all six edge/service resource types', () => {
+        const required = {
+            'AWS::CloudFront::Distribution': ['cloudfront:GetConnectionGroup', 'cloudfront:GetDistribution', 'cloudfront:GetDistributionConfig', 'cloudfront:GetVpcOrigin', 'cloudfront:ListTagsForResource', 'cloudfront:ListDistributions'],
+            'AWS::CloudFront::Function': ['cloudfront:DescribeFunction', 'cloudfront:GetFunction', 'cloudfront:ListFunctions', 'cloudfront:ListTagsForResource'],
+            'AWS::Route53::RecordSet': ['route53:ListHostedZones', 'route53:ListResourceRecordSets', 'route53:GetHostedZone', 'route53:GetChange'],
+            'AWS::Lambda::Url': ['lambda:GetFunctionUrlConfig', 'lambda:ListFunctionUrlConfigs'],
+            'AWS::Lambda::Permission': ['lambda:GetPolicy'],
+            'AWS::Logs::LogGroup': ['logs:DescribeLogGroups', 'logs:ListTagsForResource', 'logs:GetDataProtectionPolicy', 'logs:DescribeIndexPolicies', 'logs:DescribeResourcePolicies'],
+        };
+        const allowed = statements('GitHubDeployRole').filter(statement => statement.Effect === 'Allow').flatMap(actions);
+        for (const action of Object.values(required).flat()) {
+            expect(allowed.some(grant => grant === action || grant === `${action.split(':')[0]}:*`)).toBe(true);
+        }
+        for (const action of ['logs:DescribeIndexPolicies', 'logs:DescribeResourcePolicies', 'cloudfront:ListFunctions', 'cloudfront:ListDistributions']) {
+            const grant = statements('GitHubDeployRole').find(statement => actions(statement).includes(action));
+            expect(grant?.Resource).toBe('*');
+            expect(grant?.Condition).toEqual({ StringEquals: { 'aws:CalledViaLast': 'cloudformation.amazonaws.com' } });
+        }
     });
 
     test('OIDC trust binds the immutable owner/repository IDs and the main branch only', () => {
@@ -263,7 +418,7 @@ describe('CI workflow', () => {
         expect(workflowText).toContain('bun-version: 1.4.4');
         expect(workflowText).toContain("node-version: '26'");
         expect(workflowText).toContain('node scripts/verify-deployment.mjs');
-        expect(workflowText).toContain("PUBLIC_ENDPOINT_ENABLED: ${{ vars.PUBLIC_ENDPOINT_ENABLED || 'false' }}");
+        expect(workflowText).not.toContain('PUBLIC_ENDPOINT_ENABLED');
     });
 });
 
@@ -282,7 +437,9 @@ describe('no secret material anywhere in configuration', () => {
             expect(text).not.toMatch(/(?<![A-Za-z0-9])(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[a-z])(?=[A-Za-z0-9]*[A-Z])[A-Za-z0-9]{32,}(?![A-Za-z0-9])/);
         }
         // The training key is operator-provisioned, never a CloudFormation resource.
-        expect(Object.values(resources).some(resource => resource.Type === 'AWS::SSM::Parameter')).toBe(false);
+        expect(Object.values(resources).filter(resource => resource.Type === 'AWS::SSM::Parameter').map(resource => resource.Properties['Name']).sort()).toEqual([
+            '/wildduck-spam-trainer/prod/allowed-source-ips', '/wildduck-spam-trainer/prod/origin-secret-rotation-serial',
+        ]);
     });
 
     test('the project never mentions a webhook query secret', async () => {
