@@ -40,7 +40,9 @@ const FLAGGED = '\\flagged';
 const MAX_JSON_BYTES = 32 * 1024 * 1024;
 const OBJECT_ID = /^[0-9a-f]{24}$/;
 
-const trained = (outcome = 'trained'): Decision => ({ status: 200, action: 'trained', outcome, level: 'info' });
+const trained = (): Decision => ({ status: 200, action: 'trained', outcome: 'trained', level: 'info' });
+/** A completed hand-off the learn side did not act on (208, 204): answered 200 so WildDuck never retries. */
+const handedOff = (outcome: 'already_learned' | 'not_learnable'): Decision => ({ status: 200, action: 'skipped', outcome, reason: outcome, level: 'info' });
 const ignored = (reason: string): Decision => ({ status: 200, action: 'ignored', outcome: 'ignored', reason, level: 'info' });
 const skipped = (reason: string, level: LogLevel = 'warn'): Decision => ({ status: 200, action: 'skipped', outcome: 'skipped', reason, level });
 const retry = (reason: string, status: 502 | 503 = 502): Decision => ({ status, action: 'retry', outcome: 'retry', reason, level: 'error' });
@@ -349,8 +351,9 @@ class TrainingRun {
             this.log.info('message_streamed', { upstream: 'eml', bytes: stripped.stripper.inputBytes, removedHeaders: stripped.stripper.removedFields });
         }
         if (success) {
-            // 208: already learned; 204: not learnable (token count, learn conditions). Log detail only.
-            return trained(status === 208 ? 'already_learned' : status === 204 ? 'not_learnable' : 'trained');
+            // 208: already learned; 204: not learnable (token count, learn conditions). Both are
+            // answered 200 `skipped`, because a retry cannot change the result.
+            return status === 208 ? handedOff('already_learned') : status === 204 ? handedOff('not_learnable') : trained();
         }
         if (status === 413) {
             return skipped('too_large');

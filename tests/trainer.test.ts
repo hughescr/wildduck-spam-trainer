@@ -190,15 +190,17 @@ describe('learn outcomes', () => {
 
     const trainedAs = (outcome: string) => ({ webhook: 200, body: { action: 'trained' }, outcome, level: 'info' });
     const skippedAs = (reason: string) => ({ webhook: 200, body: { action: 'skipped', reason }, outcome: 'skipped', level: 'warn' });
+    /** A completed hand-off the learn side did not act on: 200 `skipped`, logged under its own outcome at info. */
+    const handedOffAs = (reason: 'already_learned' | 'not_learnable') => ({ webhook: 200, body: { action: 'skipped', reason }, outcome: reason, level: 'info' });
     const retriedAs = (reason: string, webhook = 502) => ({ webhook, body: { action: 'retry', reason }, outcome: 'retry', level: 'error' });
     /** Learn status classification: the status alone decides; the body is never read. */
     const STATUS_TABLE: [number, ReturnType<typeof trainedAs>][] = [
         [200, trainedAs('trained')],
         [201, trainedAs('trained')],
         [202, trainedAs('trained')],
-        [204, trainedAs('not_learnable')],
+        [204, handedOffAs('not_learnable')],
         [206, trainedAs('trained')],
-        [208, trainedAs('already_learned')],
+        [208, handedOffAs('already_learned')],
         [400, skippedAs('learn_rejected')],
         [404, skippedAs('learn_rejected')],
         [405, skippedAs('learn_rejected')],
@@ -487,6 +489,63 @@ describe('a 2xx is a hand-off only once the upload completed', () => {
         expect(parse(result)).toEqual({ action: 'retry', reason: 'upload_incomplete' });
         expect(harness.records().find(record => record['event'] === 'upload_incomplete')).toMatchObject({ level: 'error', upstream: 'learn', upstreamStatus: 200 });
     });
+
+    for (const [code, reason] of [[208, 'already_learned'], [204, 'not_learnable']] as const) {
+        const answered = { action: 'skipped', reason };
+
+        test(`early ${code} with the body still pending and a healthy source: the whole message is delivered, then skipped/${reason}`, async () => {
+            const chunks = Array.from({ length: 8 }, (_, index) => `${BODY_MARKER}-${index}\r\n`);
+            const raw = `Delivered-To: ${ADDRESS}\r\nX-Rspamd-Score: 3\r\nSubject: ${SUBJECT}\r\n\r\n`;
+            const { route, upload } = earlyLearn(() => status(code));
+            const harness = buildApp({ routes: spamRoutes({ eml: () => emlResponse(slowSource(raw, chunks)), learn: route }) });
+            const result = await harness.app(hook());
+            expect(upload.end).toBe('eof');
+            expect(result.statusCode).toBe(200);
+            expect(parse(result)).toEqual(answered);
+            expect(upload.chunksBeforeResponse).toBe(1);
+            expect(upload.text()).toBe(`Subject: ${SUBJECT}\r\n\r\n${chunks.join('')}`);
+            expect(upload.call?.signal.aborted).toBe(false);
+            expect(harness.records().find(record => record['event'] === 'request_completed')).toMatchObject({ outcome: reason, level: 'info', status: 200 });
+        });
+
+        test(`early ${code}, then the source fails before the upload completes: retryable eml_read_failed, never skipped/${reason}`, async () => {
+            const source = new ReadableStream<Uint8Array>({
+                start(controller) { controller.enqueue(new TextEncoder().encode('Subject: x\r\n\r\npart')); },
+                pull(controller) { controller.error(new Error('connection reset')); },
+            }, { highWaterMark: 0 });
+            const { route, upload } = earlyLearn(() => status(code));
+            const harness = buildApp({ routes: spamRoutes({ eml: () => emlResponse(source), learn: route }) });
+            const result = await harness.app(hook());
+            await upload.done;
+            expect(result.statusCode).toBe(502);
+            expect(parse(result)).toEqual({ action: 'retry', reason: 'eml_read_failed' });
+            expect(upload.end).toBe('error');
+        });
+
+        test(`early ${code}, then the deadline expires before the upload completes: 503, never skipped/${reason}`, async () => {
+            const { route, upload } = earlyLearn(() => status(code));
+            const harness = buildApp({ routes: spamRoutes({ eml: () => emlResponse(hangingSource()), learn: route }) });
+            const result = await harness.app(hook(), { getRemainingTimeInMillis: () => 3_200 });
+            await upload.done;
+            expect(result.statusCode).toBe(503);
+            expect(parse(result)).toEqual({ action: 'retry', reason: 'timeout' });
+            expect(upload.end).toBe('error');
+        });
+
+        test(`early ${code}, then the learn side stops reading (cancels the upload): retryable upload_incomplete, never skipped/${reason}`, async () => {
+            const route = streamingRoute(async call => {
+                const reader = call.stream?.getReader();
+                await reader?.read();
+                reader?.cancel().catch(() => undefined);
+                return status(code);
+            });
+            const harness = buildApp({ routes: spamRoutes({ eml: () => emlResponse(slowSource('Subject: x\r\n\r\n', ['a', 'b'])), learn: route }) });
+            const result = await harness.app(hook());
+            expect(result.statusCode).toBe(502);
+            expect(parse(result)).toEqual({ action: 'retry', reason: 'upload_incomplete' });
+            expect(harness.records().find(record => record['event'] === 'upload_incomplete')).toMatchObject({ level: 'error', upstream: 'learn', upstreamStatus: code });
+        });
+    }
 });
 
 describe('malformed messages are skipped, never trained', () => {
