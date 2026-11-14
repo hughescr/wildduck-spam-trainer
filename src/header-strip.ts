@@ -2,15 +2,17 @@
  * Byte-level header normalization for Bayes training.
  *
  * Principle: reconstruct the message as it was when Rspamd originally scanned
- * it. Only header fields that our own pipeline adds after the scan are removed;
- * every header field that was (or may have been) present at scan time, and the
- * body, are preserved byte for byte. When unsure, preserve. A message that looks
- * malformed is not trained at all.
+ * it. Remove the X-Rspamd-, X-Spamd- and X-Spam- prefix families, the five exact
+ * names WD-Mail-Classification, WD-Mail-Classification-Source,
+ * WD-Mail-Classification-Info, BIMI-Location and BIMI-Indicator, and leading
+ * Delivered-To/Return-Path fields as described below. All other header fields
+ * and the body are preserved byte for byte. Malformed messages are not trained.
  *
  * Rules:
- * 1. Every field named in {@link POST_SCAN_HEADER_NAMES} (exact, case-insensitive
- *    name; whitespace before the colon allowed) is removed wherever it appears in
- *    the header section, together with its folded continuation lines.
+ * 1. Every field whose name is in {@link POST_SCAN_HEADER_NAMES} (exact) or starts
+ *    with one of {@link POST_SCAN_HEADER_PREFIXES} (case-insensitive name;
+ *    whitespace before the colon allowed) is removed wherever it appears in the
+ *    header section, together with all its folded continuation lines.
  * 2. WildDuck prepends `Delivered-To` and `Return-Path` to every stored message.
  *    They are removed only while they are the leading fields: the first field if
  *    it is one of them, then the second if it is the other one (either order, at
@@ -37,19 +39,26 @@ export const MAX_HEADER_SECTION_BYTES = 1024 * 1024;
 export const MAX_MESSAGE_BYTES = 25 * 1024 * 1024;
 
 /**
- * Lower-cased names of the header fields added after the Rspamd scan, removed
- * wherever they appear:
- * - `X-Rspamd-Bar`, `X-Rspamd-Report`, `X-Rspamd-Score`: added by Haraka from the scan result
+ * Lower-cased exact names of the header fields added after the Rspamd scan,
+ * removed wherever they appear:
  * - `WD-Mail-Classification`, `-Source`, `-Info`: the only fields WildDuck's filter handler adds
+ * - `BIMI-Location`, `BIMI-Indicator`: added by the Haraka BIMI plugin (the indicator can be a very large folded field)
  */
 export const POST_SCAN_HEADER_NAMES: ReadonlySet<string> = new Set([
-    'x-rspamd-bar',
-    'x-rspamd-report',
-    'x-rspamd-score',
     'wd-mail-classification',
     'wd-mail-classification-source',
     'wd-mail-classification-info',
+    'bimi-location',
+    'bimi-indicator',
 ]);
+
+/**
+ * Lower-cased prefixes of the header field families added after the Rspamd scan
+ * (Haraka's rspamd plugin and Rspamd itself, including future fields). A name
+ * matches when it starts with the prefix; the hyphen is part of the prefix, so
+ * `X-Spam` and `X-Spammy` are not in a family.
+ */
+export const POST_SCAN_HEADER_PREFIXES: readonly string[] = ['x-rspamd-', 'x-spamd-', 'x-spam-'];
 
 /** Lower-cased names of the delivery fields WildDuck prepends; removed only as the leading fields. */
 export const LEADING_DELIVERY_HEADER_NAMES: readonly string[] = ['delivered-to', 'return-path'];
@@ -80,16 +89,20 @@ const HTAB = 0x09;
 const COLON = 0x3a;
 /** `From `: an mbox envelope line. */
 const MBOX_FROM = [0x46, 0x72, 0x6f, 0x6d, SP] as const;
-/** No listed name is longer; longer names are never lower-cased. */
+/** No exact name is longer, and no prefix is longer than the first bytes of a name; only this many name bytes are ever lower-cased. */
 const MAX_LISTED_NAME_BYTES = 32;
 
 /** RFC 5322 field-name byte: printable US-ASCII except the colon. */
 const isNameByte = (byte: number) => byte >= 0x21 && byte <= 0x7e && byte !== COLON;
 const isWsp = (byte: number | undefined) => byte === SP || byte === HTAB;
 
-/** True when a lower-cased header field name is one of the post-scan fields removed everywhere. */
+/**
+ * True when a lower-cased header field name is a post-scan field removed everywhere:
+ * an exact listed name, or a name in one of the prefix families. Only the first
+ * {@link MAX_LISTED_NAME_BYTES} bytes of a longer name need be passed.
+ */
 export function isPostScanHeaderName(lowerName: string): boolean {
-    return POST_SCAN_HEADER_NAMES.has(lowerName);
+    return POST_SCAN_HEADER_NAMES.has(lowerName) || POST_SCAN_HEADER_PREFIXES.some(prefix => lowerName.startsWith(prefix));
 }
 
 function lowerAscii(bytes: Uint8Array, start: number, end: number): string {
@@ -110,6 +123,8 @@ interface Field {
     end: number;
     /** Lower-cased name, or '' when it is too long to be a listed name. */
     name: string;
+    /** True when the name is a post-scan field (exact name or prefix family). */
+    postScan: boolean;
 }
 
 export interface NormalizedHeaders {
@@ -152,10 +167,12 @@ function acceptLine(bytes: Uint8Array, start: number, end: number, fields: Field
     if (nameEnd === start || index >= contentEnd || bytes[index] !== COLON) {
         throw new MalformedMessage(fields.length === 0 && startsWithMboxFrom(bytes, start, contentEnd) ? 'mbox_envelope' : 'invalid_line');
     }
-    fields.push({ start, end, name: nameEnd - start <= MAX_LISTED_NAME_BYTES ? lowerAscii(bytes, start, nameEnd) : '' });
+    // A name longer than the limit can still be in a prefix family: judge it by its first bytes.
+    const head = lowerAscii(bytes, start, Math.min(nameEnd, start + MAX_LISTED_NAME_BYTES));
+    fields.push({ start, end, name: nameEnd - start <= MAX_LISTED_NAME_BYTES ? head : '', postScan: isPostScanHeaderName(head) });
 }
 
-/** Applies rules A and B to a validated header section. */
+/** Removes post-scan prefix families/exact names and leading delivery fields from a validated header section. */
 function removeFields(section: Uint8Array, fields: readonly Field[]): NormalizedHeaders {
     const removed = new Set<number>();
     const first = fields[0];
@@ -167,7 +184,7 @@ function removeFields(section: Uint8Array, fields: readonly Field[]): Normalized
         }
     }
     fields.forEach((field, index) => {
-        if (isPostScanHeaderName(field.name)) {
+        if (field.postScan) {
             removed.add(index);
         }
     });

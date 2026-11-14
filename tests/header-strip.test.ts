@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
     HeaderSectionTooLarge, HeaderStripper, isPostScanHeaderName, LEADING_DELIVERY_HEADER_NAMES, MalformedMessage, MAX_HEADER_SECTION_BYTES, MessageTooLarge,
-    openStrippedBody, POST_SCAN_HEADER_NAMES, stripHeaders, type HeaderStripperOptions, type MalformedReason,
+    openStrippedBody, POST_SCAN_HEADER_NAMES, POST_SCAN_HEADER_PREFIXES, stripHeaders, type HeaderStripperOptions, type MalformedReason,
 } from '../src/header-strip';
 
 const latin1 = (value: string) => new Uint8Array(Buffer.from(value, 'latin1'));
@@ -47,7 +47,8 @@ function run(input: Uint8Array, sizes: readonly number[], options?: HeaderStripp
     return Buffer.concat(out);
 }
 
-const POST_SCAN = ['x-rspamd-bar', 'x-rspamd-report', 'x-rspamd-score', 'wd-mail-classification', 'wd-mail-classification-source', 'wd-mail-classification-info'];
+const POST_SCAN_EXACT = ['wd-mail-classification', 'wd-mail-classification-source', 'wd-mail-classification-info', 'bimi-location', 'bimi-indicator'];
+const POST_SCAN_PREFIXES = ['x-rspamd-', 'x-spamd-', 'x-spam-'];
 const LEADING = ['delivered-to', 'return-path'];
 
 /**
@@ -91,7 +92,7 @@ function reference(input: Uint8Array, cap = MAX_HEADER_SECTION_BYTES): Outcome {
     if (fields.length === 0) {
         return 'malformed';
     }
-    const drop = fields.map(field => POST_SCAN.includes(field.name));
+    const drop = fields.map(field => POST_SCAN_EXACT.includes(field.name) || POST_SCAN_PREFIXES.some(prefix => field.name.startsWith(prefix)));
     const [first, second] = fields;
     if (first && LEADING.includes(first.name)) {
         drop[0] = true;
@@ -122,25 +123,29 @@ const PRESERVED = [
     ' spf=pass smtp.mailfrom=example.org',
     'DKIM-Signature: v=1; a=rsa-sha256; d=example.org; s=s1;',
     '\tb=AbCdEf==',
-    'X-Spam-Status: Yes, score=12',
-    '\ttests=FOO,BAR',
-    'X-Spam-Flag: YES',
-    'X-Spam-Level: ********',
-    'X-Spamd-Result: default: False [9.1 / 15.0];',
-    ' R_SPF_ALLOW(-0.2)[+ip4:192.0.2.1]',
-    'X-Spamd-Bar: +++++',
-    'X-Rspamd-Queue-Id: ABC123',
-    'X-Rspamd-Server: rspamd1',
-    'X-Rspamd-Action: add header',
-    'X-Rspamd-Score-Extra: 1',
-    'X-Rspamd-Scor: 1',
+    'Original-Authentication-Results: mx.example.org; dkim=pass',
+    'ARC-Seal: i=1; a=rsa-sha256; d=example.org; s=arc; cv=none;',
+    '\tb=Seal+Seal==',
+    'ARC-Message-Signature: i=1; a=rsa-sha256; c=relaxed/relaxed;',
+    ' b=Msg+Msg==',
+    'ARC-Authentication-Results: i=1; mx.example.org;',
+    ' dkim=pass header.d=example.org',
+    'X-Spam: kept (no hyphen suffix)',
+    'X-Spammy: kept',
+    'X-Spamd: kept',
+    'X-Spamming-Status: kept',
     'X-Rspamd: 1',
+    'X-Rspamdx-Foo: kept',
+    'XSpam-Status: kept',
+    'X-Not-Spam-Status: kept',
     'WD-Mail-Classification-Other: kept',
     'WD-Mail-Classificatio: kept',
     'X-WD-Mail-Classification: kept',
+    'BIMI-Location-Other: kept',
+    'BIMI-Indicators: kept',
+    'X-BIMI-Indicator: kept',
     'X-Original-Rcpt: me@example.com',
-    'BIMI-Location: v=BIMI1; l=https://example.org/logo.svg',
-    'BIMI-Indicator: PHN2Zz4=',
+    'X-Zone-Original-Rcpt: me@zone.example.com',
     'Delivered-To: not leading, kept',
     'Return-Path: <not-leading@example.org>',
     'Subject: hello',
@@ -151,6 +156,24 @@ const REMOVED = [
     '\tFOLDED_REPORT(1)',
     'X-RSPAMD-SCORE: 15.2',
     'X-Rspamd-Score \t: 9 (whitespace before the colon)',
+    'X-Spam-Status: Yes, score=12',
+    '\ttests=FOO,BAR',
+    'X-Spam-Flag: YES',
+    'X-Spam-Level: ********',
+    'X-Spamd-Result: default: False [9.1 / 15.0];',
+    ' R_SPF_ALLOW(-0.2)[+ip4:192.0.2.1]',
+    'x-spamd-bar: +++++',
+    'X-Rspamd-Queue-Id: ABC123',
+    'X-Rspamd-Server: rspamd1',
+    'X-Rspamd-Action: add header',
+    'X-Rspamd-Score-Extra: 1',
+    'X-RSPAMD-Spam: yes',
+    'X-Spam-: empty suffix',
+    `X-Spam-${'long'.repeat(100)}: a name past the exact-name length limit`,
+    'BIMI-Location: v=BIMI1; l=https://example.org/logo.svg',
+    'bimi-indicator: PHN2Zz4=',
+    '\tQUJDREVGR0g=',
+    ' SUpLTE1OT1A=',
     'WD-Mail-Classification: spam',
     'wd-mail-classification-source: user',
     'WD-MAIL-CLASSIFICATION-INFO: moved to junk',
@@ -180,13 +203,15 @@ function sampleMessage(eol: string | ((index: number) => string)): { raw: string
 }
 
 describe('post-scan header names (rule A)', () => {
-    test('exactly the six listed names, in one exported constant', () => {
-        expect([...POST_SCAN_HEADER_NAMES].sort()).toEqual([...POST_SCAN].sort());
+    test('exactly the five exact names and three prefixes, in exported constants', () => {
+        expect([...POST_SCAN_HEADER_NAMES].sort()).toEqual([...POST_SCAN_EXACT].sort());
+        expect([...POST_SCAN_HEADER_PREFIXES]).toEqual(POST_SCAN_PREFIXES);
         expect([...LEADING_DELIVERY_HEADER_NAMES]).toEqual(LEADING);
-        for (const name of POST_SCAN) {
+        for (const name of [...POST_SCAN_EXACT, 'x-rspamd-bar', 'x-rspamd-report', 'x-rspamd-score', 'x-rspamd-spam', 'x-spamd-result', 'x-spam-status', 'x-spam-flag']) {
             expect(isPostScanHeaderName(name)).toBe(true);
         }
-        for (const name of ['x-spam-status', 'x-spam-flag', 'x-spamd-result', 'x-spamd-bar', 'x-rspamd-queue-id', 'x-rspamd-server', 'x-rspamd-action', 'wd-mail-classification-other', 'x-rspamd-score-extra', 'x-rspamd', 'delivered-to', 'return-path', 'received']) {
+        for (const name of ['x-spam', 'x-spammy', 'x-spamd', 'x-rspamd', 'x-rspamdx-foo', 'wd-mail-classification-other', 'bimi-location-other', 'x-original-rcpt', 'x-zone-original-rcpt',
+            'authentication-results', 'original-authentication-results', 'received', 'received-spf', 'dkim-signature', 'arc-seal', 'arc-message-signature', 'arc-authentication-results', 'delivered-to', 'return-path']) {
             expect(isPostScanHeaderName(name)).toBe(false);
         }
     });
@@ -212,9 +237,103 @@ describe('post-scan header names (rule A)', () => {
         expect(strip('Subject: a\r\n b\r\nX-Rspamd-Bar: Y\r\n c\r\n\td\r\nTo: x\r\n e\r\n\r\n')).toBe('Subject: a\r\n b\r\nTo: x\r\n e\r\n\r\n');
     });
 
-    test('very long names never match and are preserved', () => {
-        const long = `X-Rspamd-Score-${'a'.repeat(300)}: v\r\n`;
-        expect(strip(`${long}\r\n`)).toBe(`${long}\r\n`);
+    test('very long names match only through a prefix family', () => {
+        const family = `X-Rspamd-Score-${'a'.repeat(300)}: v\r\n`;
+        expect(strip(`Subject: s\r\n${family}\r\nbody`)).toBe('Subject: s\r\n\r\nbody');
+        const other = `Received-${'a'.repeat(300)}: v\r\nX-Spam${'a'.repeat(300)}: v\r\nBIMI-Indicator${'a'.repeat(300)}: v\r\n`;
+        expect(strip(`${other}\r\nbody`)).toBe(`${other}\r\nbody`);
+    });
+});
+
+describe('post-scan header families and BIMI fields', () => {
+    const BODY = 'Body line\r\nX-Spam-Status: body\r\nBIMI-Indicator: body\r\n\tcontinued\r\n\x00\xe9\xff\r bare';
+    const message = (...fields: string[]) => `Received: from a\r\n${fields.join('')}Subject: s\r\n\r\n${BODY}`;
+    const clean = `Received: from a\r\nSubject: s\r\n\r\n${BODY}`;
+
+    test('BIMI-Location is removed', () => {
+        expect(strip(message('BIMI-Location: v=BIMI1; l=https://example.org/logo.svg\r\n'))).toBe(clean);
+        expect(strip(message('bimi-location : v=BIMI1; l=https://example.org/logo.svg\r\n'))).toBe(clean);
+    });
+
+    test('a multiline BIMI-Indicator is removed completely, in every line-ending style', () => {
+        const indicator = (eol: string) => `BIMI-Indicator: PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcv${eol} \tMjAwMC9zdmciPjwvc3ZnPg==${eol}\tQUJD${eol}`;
+        expect(strip(message(indicator('\r\n')))).toBe(clean);
+        expect(strip(message(indicator('\r\n'), 'X-Original-Rcpt: a@b\r\n', indicator('\r\n')))).toBe(message('X-Original-Rcpt: a@b\r\n'));
+        expect(strip('Received: from a\nBIMI-Indicator: AAAA\n BBBB\nSubject: s\n\nbody')).toBe('Received: from a\nSubject: s\n\nbody');
+        expect(strip('Subject: s\r\nBIMI-INDICATOR: AAAA\r\n BBBB\r\n')).toBe('Subject: s\r\n');
+    });
+
+    test('a very large folded BIMI-Indicator under the header cap is removed completely', () => {
+        const lines = Array.from({ length: 12_000 }, (_unused, index) => ` ${'A1b2'.repeat(15)}${index % 10}\r\n`);
+        const indicator = `BIMI-Indicator: PHN2Zz4=\r\n${lines.join('')}`;
+        expect(indicator.length).toBeGreaterThan(700_000);
+        expect(indicator.length).toBeLessThan(MAX_HEADER_SECTION_BYTES);
+        const raw = `Received: from a\r\n${indicator}Subject: s\r\n\r\n${BODY}`;
+        expect(strip(raw)).toBe(clean);
+        // The same result when fed in small chunks.
+        const out = run(latin1(raw), [1000, 7, 65_536]);
+        expect(typeof out === 'string' ? out : out.toString('latin1')).toBe(clean);
+        // Over the cap it is refused like any large header section.
+        const oversized = `Received: from a\r\nBIMI-Indicator: x\r\n${lines.join('')}${lines.join('')}Subject: s\r\n\r\nbody`;
+        expect(oversized.length).toBeGreaterThan(MAX_HEADER_SECTION_BYTES);
+        expect(run(latin1(oversized), [4096])).toBe('header_too_large');
+    });
+
+    test('X-Original-Rcpt and X-Zone-Original-Rcpt are preserved', () => {
+        const raw = message('X-Original-Rcpt: me@example.com\r\n', 'X-Zone-Original-Rcpt: me@zone.example.com\r\n\t(folded)\r\n', 'x-original-rcpt: second\r\n');
+        expect(strip(raw)).toBe(raw);
+    });
+
+    test('Authentication-Results and Original-Authentication-Results are preserved', () => {
+        const raw = message('Authentication-Results: mail.example.com; dkim=pass header.d=example.org;\r\n spf=pass smtp.mailfrom=example.org\r\n', 'Original-Authentication-Results: mx.example.org; spf=fail\r\n\tdmarc=fail\r\n');
+        expect(strip(raw)).toBe(raw);
+    });
+
+    test('DKIM-Signature, ARC-Seal, ARC-Message-Signature, ARC-Authentication-Results, Received and Received-SPF are preserved byte-for-byte, folds included', () => {
+        const raw = message(
+            'DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.org;\r\n\ts=s1; h=from:to:subject;\r\n\tb=AbCdEf+/==\r\n',
+            'ARC-Seal: i=1; a=rsa-sha256; t=1767225600; cv=none; d=example.com;\r\n s=arc; b=SEAL\r\n \tMORE==\r\n',
+            'ARC-Message-Signature: i=1; a=rsa-sha256; c=relaxed/relaxed;\r\n\td=example.com; s=arc; b=MSG==\r\n',
+            'ARC-Authentication-Results: i=1; mail.example.com;\r\n dkim=pass header.d=example.org;\r\n spf=pass\r\n',
+            'Received-SPF: pass (example.org: 192.0.2.1 is authorized)\r\n',
+            'Received: from mx.example.org (mx.example.org [192.0.2.1])\r\n\tby mail.example.com with ESMTPS id abc\r\n',
+        );
+        expect(strip(raw)).toBe(raw);
+    });
+
+    test('the observed X-Rspamd result headers are removed with their folds', () => {
+        const raw = message('X-Rspamd-Bar: ++++++\r\n', 'X-Rspamd-Report: BAYES_SPAM(5.1) R_DKIM_NA(0.1)\r\n\tMIME_GOOD(-0.1)\r\n', 'X-Rspamd-Score: 15.2\r\n');
+        expect(strip(raw)).toBe(clean);
+    });
+
+    test('prefix matching removes future fields in any case, with their folds', () => {
+        const raw = message(
+            'X-Rspamd-Spam: yes\r\n', 'X-Rspamd-Queue-Id: ABC123\r\n', 'x-rspamd-server: rspamd1\r\n', 'X-RSPAMD-FUTURE-THING: 1\r\n\tfolded\r\n',
+            'X-Spamd-Result: default: False [9.1 / 15.0];\r\n R_SPF_ALLOW(-0.2)[+ip4:192.0.2.1]\r\n', 'X-SPAMD-Bar: +++\r\n', 'x-spamd-new: 1\r\n',
+            'X-Spam-Status: Yes, score=12\r\n\ttests=FOO,BAR\r\n', 'x-spam-flag: YES\r\n', 'X-SpAm-LeVeL: ***\r\n', 'X-Spam-Checker-Version: SpamAssassin\r\n', 'X-Spam-\t: x\r\n',
+        );
+        expect(strip(raw)).toBe(clean);
+    });
+
+    test('names that only look like a family are preserved: X-Spam, X-Spammy and other near misses', () => {
+        const raw = message(
+            'X-Spam: yes\r\n', 'X-Spammy: yes\r\n', 'X-Spamd: yes\r\n', 'X-Spamming-Status: yes\r\n', 'X-Rspamd: 1\r\n', 'X-Rspamdx-Foo: 1\r\n',
+            'XSpam-Status: 1\r\n', 'X-Not-Spam-Status: 1\r\n', 'Spam-Status: 1\r\n', 'WD-Mail-Classification-Other: 1\r\n', 'BIMI-Location-Other: 1\r\n', 'BIMI-Indicators: 1\r\n',
+        );
+        expect(strip(raw)).toBe(raw);
+    });
+
+    test('a continuation line after a preserved near-miss stays with it', () => {
+        const raw = 'X-Spammy: a\r\n b\r\nX-Spam-Status: c\r\n d\r\n\te\r\nX-Spam: f\r\n g\r\n\r\nbody';
+        expect(strip(raw)).toBe('X-Spammy: a\r\n b\r\nX-Spam: f\r\n g\r\n\r\nbody');
+    });
+
+    test('the body is byte-identical when fields are removed, including header-like body lines', () => {
+        const head = latin1('X-Spam-Status: Yes\r\nBIMI-Indicator: AAAA\r\n BBBB\r\nX-Rspamd-Score: 1\r\nSubject: s\r\n\r\n');
+        const body = new Uint8Array(4096).map((_unused, index) => (index * 13) % 256);
+        const out = stripHeaders(new Uint8Array(Buffer.concat([head, body])));
+        expect(Buffer.from(out).equals(Buffer.concat([latin1('Subject: s\r\n\r\n'), body]))).toBe(true);
+        expect(strip(`Subject: s\r\n\r\nX-Spam-Status: no\r\nBIMI-Location: x\r\n`)).toBe('Subject: s\r\n\r\nX-Spam-Status: no\r\nBIMI-Location: x\r\n');
     });
 });
 
@@ -386,6 +505,7 @@ describe('chunk boundaries against the whole-buffer reference', () => {
         const random = seeded(0x5eed_1234);
         const pick = <T,>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
         const names = ['Subject', 'X-Spam-Flag', 'X-Spam-Status', 'X-Spamd-Result', 'X-Rspamd-Queue-Id', 'X-Rspamd-Server', 'X-Rspamd-Score', 'x-rspamd-bar', 'X-RSPAMD-REPORT',
+            'X-Spam', 'X-Spammy', 'X-Rspamd', 'BIMI-Location', 'bimi-indicator', 'BIMI-Indicators', 'X-Original-Rcpt', 'DKIM-Signature', `X-Spam-${'n'.repeat(40)}`,
             'WD-Mail-Classification', 'wd-mail-classification-source', 'WD-MAIL-CLASSIFICATION-INFO', 'WD-Mail-Classification-Other', 'Received', 'Delivered-To', 'Return-Path', 'From', 'To'];
         const values = ['', ' v', ' value with spaces', '\tTAB value', ' caf\xe9 \xff', ' a:b:c', ` ${'x'.repeat(90)}`];
         const malformed = ['no colon here', ':leading colon', 'Bad Name: x', 'Subject', 'From sender date', 'Na\x00me: x', 'X: a\x00b', '\xe9name: x', ' '];

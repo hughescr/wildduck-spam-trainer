@@ -24,6 +24,7 @@ export const RAW_MESSAGE = [
     `Delivered-To: ${ADDRESS}\r\n`,
     `Return-Path: <${ADDRESS}>\r\n`,
     'Received: from mx.example.org (mx.example.org [192.0.2.1])\r\n\tby mail.rungie.com; Mon, 1 Jan 2026 00:00:00 +0000\r\n',
+    'Authentication-Results: mail.rungie.com; spf=pass smtp.mailfrom=example.org\r\n',
     'X-Spam-Flag: YES\r\n',
     'X-Rspamd-Score: 15.2\r\n\t(folded continuation)\r\n',
     `From: ${ADDRESS}\r\n`,
@@ -33,10 +34,10 @@ export const RAW_MESSAGE = [
     '\r\n',
     `${BODY_MARKER}\r\nX-Rspamd-Score: 1\r\n`,
 ].join('');
-/** RAW_MESSAGE minus the four removed fields (Delivered-To, Return-Path, X-Rspamd-Score, WD-Mail-Classification). */
+/** RAW_MESSAGE minus the five removed fields (Delivered-To, Return-Path, X-Spam-Flag, X-Rspamd-Score, WD-Mail-Classification). */
 export const STRIPPED_MESSAGE = [
     'Received: from mx.example.org (mx.example.org [192.0.2.1])\r\n\tby mail.rungie.com; Mon, 1 Jan 2026 00:00:00 +0000\r\n',
-    'X-Spam-Flag: YES\r\n',
+    'Authentication-Results: mail.rungie.com; spf=pass smtp.mailfrom=example.org\r\n',
     `From: ${ADDRESS}\r\n`,
     `Subject: ${SUBJECT}\r\n`,
     `Message-ID: ${MESSAGE_ID}\r\n`,

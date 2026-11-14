@@ -544,7 +544,7 @@ describe('malformed messages are skipped, never trained', () => {
         const body = `${BODY_MARKER}\r\nX-Rspamd-Score: 9\r\n\u0000\r bare CR and NUL in the body are fine`;
         for (const [raw, expected] of [
             ['Delivered-To: a@b\nReturn-Path: <a@b>\nSubject: lf only\nX-Rspamd-Bar: +++\n\n' + body, 'Subject: lf only\n\n' + body],
-            ['Subject: mixed\nTo: x\r\nX-Spam-Flag: YES\n\r\n' + body, 'Subject: mixed\nTo: x\r\nX-Spam-Flag: YES\n\r\n' + body],
+            ['Subject: mixed\nTo: x\r\nX-Spam-Flag: YES\n\r\n' + body, 'Subject: mixed\nTo: x\r\n\r\n' + body],
             ['Subject: no body\r\nWD-Mail-Classification: spam\r\n', 'Subject: no body\r\n'],
             ['Subject: no newline at all', 'Subject: no newline at all'],
             [`Subject: 8-bit éÿ ${'v'.repeat(20_000)}\r\n\r\n${body}`, `Subject: 8-bit éÿ ${'v'.repeat(20_000)}\r\n\r\n${body}`],
@@ -622,6 +622,6 @@ describe('logging never leaks sensitive data', () => {
         expect(completed).toMatchObject({ requestId: 'req-1', deliveryId: '65a1b2c3d4e5f6a7b8c9d0e1:1', ev: 'marked.spam', user: USER, mailbox: MAILBOX, uid: UID, route: '/hooks/wildduck', method: 'POST', status: 200, outcome: 'trained' });
         const upstreams = records().filter(record => record['event'] === 'upstream_response').map(record => record['upstream']);
         expect(upstreams).toEqual(['mailbox', 'eml', 'learn']);
-        expect(records().find(record => record['event'] === 'message_streamed')).toMatchObject({ bytes: RAW_MESSAGE.length, removedHeaders: 4 });
+        expect(records().find(record => record['event'] === 'message_streamed')).toMatchObject({ bytes: RAW_MESSAGE.length, removedHeaders: 5 });
     });
 });
